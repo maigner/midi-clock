@@ -1,0 +1,15 @@
+[package]
+name = "clockgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 1 tool: fixed-tempo MIDI clock + click, jitter and latency measurement"
+
+[dependencies]
+rtio = { path = "../../crates/rtio" }
+tracker = { path = "../../crates/tracker" }
+click = { path = "../../crates/click" }
+midiclock = { path = "../../crates/midiclock" }
+clap.workspace = true
+anyhow.workspace = true
+ctrlc.workspace = true

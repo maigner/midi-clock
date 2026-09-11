@@ -1,0 +1,11 @@
+[package]
+name = "rtio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw ALSA duplex audio, raw MIDI output and real-time thread helpers"
+
+[dependencies]
+alsa.workspace = true
+libc.workspace = true
+anyhow.workspace = true

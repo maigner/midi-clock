@@ -1,0 +1,13 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Touch-screen front end drawn straight to the Linux framebuffer, touch via evdev"
+
+[dependencies]
+tracker = { path = "../tracker" }
+sequencer = { path = "../sequencer" }
+rtio = { path = "../rtio" }
+libc.workspace = true
+embedded-graphics = "0.8"

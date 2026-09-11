@@ -1,0 +1,4 @@
+/target
+*.wav
+/test-data/generated/
+patterns.toml

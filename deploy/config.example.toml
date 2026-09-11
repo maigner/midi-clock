@@ -1,0 +1,97 @@
+# midi-clock configuration. Every key is optional; missing keys use defaults.
+# Find device names with:  midi-clock --list-devices
+
+[audio]
+enabled = true                        # false = no audio interface at all (touch UI + MIDI only)
+capture_device = "hw:CARD=US2x2"      # raw ALSA device, never "default"/plughw
+playback_device = "hw:CARD=US2x2"
+sample_rate = 48000
+period_frames = 64                    # 1.33 ms at 48 kHz. Use 128 on a stock (non-RT) kernel.
+periods = 3                           # buffer = periods * period_frames
+capture_channels = 2
+playback_channels = 2
+mic_channel = 0                       # 0-based capture channel with the microphone
+click_channels = [0, 1]               # playback channels that get the click
+monitor_gain = 0.0                    # mix the mic into the click outputs (0 = off)
+# Latency ALSA cannot see (USB pipeline, converters). Measure with:
+#   clockgen latency --audio hw:CARD=US2x2   (loopback cable from output to input)
+extra_input_latency_ms = 1.0
+extra_output_latency_ms = 1.0
+
+[onset]
+frame_size = 1024
+hop = 128                             # 2.67 ms analysis resolution at 48 kHz
+kick_band_hz = [40.0, 130.0]
+hi_band_hz = [1500.0, 8000.0]
+w_flux = 1.0                          # weights of full-band / kick / snare-hat flux
+w_kick = 2.0
+w_hi = 1.0
+agc_tau_s = 2.0                       # time constant of the level normalisation
+threshold_ratio = 2.5                 # onset if ODF > ratio * running mean
+min_onset_gap_ms = 50.0
+gate_dbfs = -55.0                     # below this input level nothing is analysed
+
+[tempo]
+bpm_min = 60.0                        # narrow this per song to prevent octave errors
+bpm_max = 200.0
+bpm_center = 110.0                    # centre of the tempo prior
+bpm_width_octaves = 0.8
+history_s = 4.0                       # ODF window for tempo estimation
+estimate_interval_s = 0.25
+min_tempo_strength = 0.12
+tempo_hysteresis = 0.3                # bonus for staying at the current tempo
+kp = 0.45                             # phase correction gain per onset
+ki = 0.1                              # period correction gain per onset
+period_blend = 0.3                    # blend towards each new tempo estimate
+accept_window = 0.2                   # onsets farther than 20 % of a beat are ignored
+max_phase_slew = 0.1                  # max phase jump per correction (fraction of beat)
+lock_estimates = 2                    # agreeing estimates (0.25 s apart) before Start
+coast_beats = 3                       # missed beats before "coasting"
+stop_after_s = 8.0                    # silence before MIDI Stop is sent
+onset_offset_ms = 7.0                 # ODF peak delay vs true hit; check with `eval run --ann`
+bar_len = 4
+full_weight_strength = 6.0
+
+[midi]
+enabled = true
+device = "hw:CARD=US2x2,0,0"          # rawmidi port, see --list-devices
+lead_ms = 1.5                         # send each tick this early (USB + slave latency)
+send_start_stop = true
+
+[click]
+enabled = true
+freq_hz = 1000.0
+accent_freq_hz = 1500.0               # used on beat 1 once the downbeat is known
+duration_ms = 6.0
+gain = 0.5
+accent_gain = 0.8
+lead_ms = 0.0                         # extra lead for the click only
+
+[realtime]
+audio_priority = 80                   # SCHED_FIFO priorities (0 = normal scheduling)
+midi_priority = 85
+sequencer_priority = 84
+tracker_priority = 60
+cpu = 3                               # pin audio + MIDI threads to this CPU (-1 = none)
+lock_memory = true
+
+[ui]
+enabled = true                        # touch-screen front end on the Linux framebuffer (no X/Wayland)
+framebuffer = "/dev/fb0"
+touch_device = ""                     # evdev node of the touch panel, "" = autodetect
+touch_swap_xy = false                 # fix a panel whose axes are mounted rotated/mirrored
+touch_invert_x = false
+touch_invert_y = false
+touch_grab = true                     # take the touch panel exclusively
+rotation = 0                          # 0, 90, 180 or 270 degrees, for portrait-mounted screens
+fps = 25                              # maximum redraw rate; redraws only happen when something changed
+tty = "/dev/tty1"                     # console switched to graphics mode so it stops drawing over us
+tap_offset_ms = 10.0                  # touch panel latency; raise until a tapped beat sits on the click
+start_mode = "auto"                   # "auto" follows the mic, "manual" waits for taps / Start
+manual_bpm = 120.0                    # tempo the manual clock starts with
+tap_timeout_s = 2.0                   # taps farther apart than this start a new tap sequence
+
+[sequencer]
+enabled = true                        # 16-step pattern sequencer on the SEQUENCE tab, notes on the MIDI port
+file = "patterns.toml"                # patterns are saved here after every edit (relative to the working dir)
+lead_ms = 0.0                         # extra lead for notes on top of midi.lead_ms

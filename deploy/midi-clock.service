@@ -1,0 +1,31 @@
+[Unit]
+Description=Live beat tracking to MIDI master clock
+After=sound.target
+Wants=sound.target
+# The touch UI owns the first virtual console; no login prompt there.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+Type=simple
+User=midiclock
+Group=audio
+SupplementaryGroups=video input tty
+# Framebuffer UI: make tty1 ours so it can be switched to graphics mode.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+WorkingDirectory=/etc/midi-clock
+ExecStart=/usr/local/bin/midi-clock --config /etc/midi-clock/config.toml
+Restart=always
+RestartSec=2
+# Real-time and memory-lock permissions for the service user.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Nice=-10
+# Wait for the USB interface if it enumerates after boot.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do grep -q -i "$(sed -n "s/^capture_device *= *\"hw:CARD=\\([^\\"]*\\)\"/\\1/p" /etc/midi-clock/config.toml)" /proc/asound/cards && exit 0; sleep 1; done; exit 0'
+
+[Install]
+WantedBy=multi-user.target

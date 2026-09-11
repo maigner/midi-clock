@@ -1,0 +1,9 @@
+[package]
+name = "click"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sample-accurate metronome click rendered from the beat grid"
+
+[dependencies]
+tracker = { path = "../tracker" }

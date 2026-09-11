@@ -1,0 +1,16 @@
+[package]
+name = "uisim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop simulator for the touch UI: a window, the mouse as finger, a virtual drummer"
+
+[dependencies]
+ui = { path = "../../crates/ui" }
+tracker = { path = "../../crates/tracker" }
+rtio = { path = "../../crates/rtio" }
+sequencer = { path = "../../crates/sequencer" }
+arc-swap.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+minifb = { version = "0.28", default-features = false, features = ["x11"] }

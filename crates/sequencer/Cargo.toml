@@ -1,0 +1,12 @@
+[package]
+name = "sequencer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "16-step pattern sequencer driven by the beat grid, MIDI notes out"
+
+[dependencies]
+rtio = { path = "../rtio" }
+tracker = { path = "../tracker" }
+serde.workspace = true
+toml.workspace = true

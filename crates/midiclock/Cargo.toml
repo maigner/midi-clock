@@ -1,0 +1,11 @@
+[package]
+name = "midiclock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MIDI clock emitter driven by the beat grid"
+
+[dependencies]
+rtio = { path = "../rtio" }
+tracker = { path = "../tracker" }
+anyhow.workspace = true

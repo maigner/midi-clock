@@ -1,0 +1,13 @@
+[package]
+name = "eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline evaluation: synthesise drum tracks, run the tracker on WAV files, score against annotations"
+
+[dependencies]
+onset = { path = "../../crates/onset" }
+tracker = { path = "../../crates/tracker" }
+clap.workspace = true
+anyhow.workspace = true
+hound.workspace = true

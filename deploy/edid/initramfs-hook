@@ -1,0 +1,6 @@
+#!/bin/sh
+# initramfs hook: ship the panel EDID override so drm.edid_firmware finds it early.
+[ "$1" = prereqs ] && { echo; exit 0; }
+. /usr/share/initramfs-tools/hook-functions
+mkdir -p "$DESTDIR/lib/firmware/edid"
+cp /lib/firmware/edid/rb-lcd10-2.bin "$DESTDIR/lib/firmware/edid/"

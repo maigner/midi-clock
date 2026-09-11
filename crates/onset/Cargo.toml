@@ -1,0 +1,9 @@
+[package]
+name = "onset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "STFT onset detection function tuned for drums, allocation-free hot path"
+
+[dependencies]
+realfft.workspace = true

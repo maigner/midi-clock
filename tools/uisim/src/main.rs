@@ -1,0 +1,315 @@
+//! Run the touch UI in a desktop window. The mouse is the finger, a virtual
+//! drummer feeds the real tracker so AUTO mode behaves like on stage.
+//!
+//! Keys:  D  drummer on/off      [ ]  drummer tempo -/+ 2 BPM
+//!        J  toggle 15 ms timing jitter     Q / Esc  quit
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
+use sequencer::{NoteOut, SeqState, SeqStats};
+use tracker::{Grid, HopInput, ManualClock, ManualConfig, Tracker, TrackerConfig};
+use ui::{Action, Canvas, Mode, PixelFormat, Rotation, Session, Status, TouchEvent, UiConfig};
+
+/// Notes go to stderr instead of a MIDI port.
+struct PrintNotes;
+impl NoteOut for PrintNotes {
+    fn note_on(&self, channel: u8, note: u8, vel: u8) -> bool {
+        eprintln!("note on  ch{:2} {:>4} vel {vel}", channel + 1, sequencer::note_name(note));
+        true
+    }
+    fn note_off(&self, _channel: u8, _note: u8) -> bool {
+        true
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(about = "Desktop simulator for the midi-clock touch UI")]
+struct Args {
+    /// Screen size, WIDTHxHEIGHT (the Joy-it RB-LCD-10-2 is 1280x800).
+    #[arg(long, default_value = "1280x800")]
+    size: String,
+    /// Screen rotation in degrees as in the config (0, 90, 180, 270).
+    #[arg(long, default_value_t = 0)]
+    rotation: u32,
+    /// Start in this mode.
+    #[arg(long, default_value = "auto")]
+    mode: String,
+    /// Virtual drummer tempo.
+    #[arg(long, default_value_t = 118.0)]
+    drummer_bpm: f64,
+    /// Start with the drummer playing.
+    #[arg(long)]
+    drummer: bool,
+    /// Pattern file to load and save (default: patterns.toml in the current directory).
+    #[arg(long, default_value = "patterns.toml")]
+    patterns: std::path::PathBuf,
+    /// Print sequencer notes to stderr as they are sent.
+    #[arg(long)]
+    print_notes: bool,
+}
+
+/// A drummer that hits every beat, feeding hops to the tracker like the audio thread does.
+struct Drummer {
+    playing: bool,
+    bpm: f64,
+    jitter: bool,
+    next_beat: f64,
+    hop_time: f64,
+    seed: u64,
+}
+
+impl Drummer {
+    fn rand(&mut self) -> f64 {
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.seed >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Generate hops up to `now`.
+    fn advance(&mut self, now: f64, tr: &mut Tracker, hop_dt: f64) {
+        while self.hop_time + hop_dt <= now {
+            self.hop_time += hop_dt;
+            let t = self.hop_time;
+            let mut odf = 0.3 + self.rand() as f32 * 0.2;
+            let mut onset = None;
+            if self.playing {
+                if t >= self.next_beat {
+                    let strength = 6.0 + self.rand() as f32 * 3.0;
+                    odf = strength;
+                    onset = Some((self.next_beat, strength));
+                    let j = if self.jitter { (self.rand() - 0.5) * 0.03 } else { 0.0 };
+                    self.next_beat += 60.0 / self.bpm + j;
+                }
+            } else {
+                self.next_beat = t + 0.1;
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: odf, onset });
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let (w, h) = args
+        .size
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+        .context("--size must be WIDTHxHEIGHT")?;
+    let rotation = Rotation::from_degrees(args.rotation).context("rotation must be 0/90/180/270")?;
+    let ucfg = UiConfig { rotation: args.rotation, tap_offset_s: 0.0, ..UiConfig::default() };
+    // The window shows the physical panel; the canvas handles rotation.
+    let canvas = Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, rotation);
+    let mut session = Session::new(&ucfg, canvas);
+    let mut window = Window::new("midi-clock UI simulator", w, h, WindowOptions::default())?;
+    window.set_target_fps(60);
+
+    let mut mode = if args.mode.eq_ignore_ascii_case("manual") { Mode::Manual } else { Mode::Auto };
+    let tcfg = TrackerConfig::default();
+    let hop_dt = tcfg.hop_dt;
+    let mut tracker = Tracker::new(tcfg);
+    let mut manual = ManualClock::new(ManualConfig::default(), 120.0);
+    let t0 = rtio::now();
+    let mut drummer = Drummer { playing: args.drummer, bpm: args.drummer_bpm, jitter: false, next_beat: t0 + 1.0, hop_time: t0, seed: 42 };
+    let live_shared = Arc::new(Mutex::new(if mode == Mode::Manual { manual.grid() } else { tracker.grid() }));
+    let mut live: Grid = *live_shared.lock().unwrap();
+    // Sequencer: real thread, notes printed instead of sent.
+    let seq_path = args.patterns.clone();
+    let mut seq = Arc::new(if seq_path.exists() { SeqState::load(&seq_path).unwrap_or_default() } else { SeqState::default() });
+    let mut seq_dirty: Option<f64> = None;
+    let seq_snapshot = Arc::new(ArcSwap::from_pointee(seq.snapshot()));
+    let seq_stop = Arc::new(AtomicBool::new(false));
+    let seq_thread = {
+        let live = live_shared.clone();
+        let snap = seq_snapshot.clone();
+        let stop = seq_stop.clone();
+        let print = args.print_notes;
+        std::thread::spawn(move || {
+            struct Quiet;
+            impl NoteOut for Quiet {
+                fn note_on(&self, _: u8, _: u8, _: u8) -> bool {
+                    true
+                }
+                fn note_off(&self, _: u8, _: u8) -> bool {
+                    true
+                }
+            }
+            let stats = SeqStats::default();
+            let get_grid = || *live.lock().unwrap();
+            if print {
+                sequencer::run(get_grid, || snap.load_full(), &PrintNotes, 0.0, &stop, &stats);
+            } else {
+                sequencer::run(get_grid, || snap.load_full(), &Quiet, 0.0, &stop, &stats);
+            }
+        })
+    };
+    let mut ticks = 0u64;
+    let mut last_tick_beat = i64::MIN;
+    let mut pixels = vec![0u32; w * h];
+    let mut mouse_down = false;
+    let mut d_held = false;
+    let mut j_held = false;
+    let mut lb_held = false;
+    let mut rb_held = false;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
+        let now = rtio::now();
+        // --- virtual drummer -> real tracker -----------------------------------
+        drummer.advance(now, &mut tracker, hop_dt);
+        // --- keys -------------------------------------------------------------------
+        let key_edge = |win: &Window, k: Key, held: &mut bool| -> bool {
+            let down = win.is_key_down(k);
+            let edge = down && !*held;
+            *held = down;
+            edge
+        };
+        if key_edge(&window, Key::D, &mut d_held) {
+            drummer.playing = !drummer.playing;
+            eprintln!("drummer {}", if drummer.playing { "playing" } else { "silent" });
+        }
+        if key_edge(&window, Key::J, &mut j_held) {
+            drummer.jitter = !drummer.jitter;
+            eprintln!("jitter {}", drummer.jitter);
+        }
+        if key_edge(&window, Key::LeftBracket, &mut lb_held) {
+            drummer.bpm -= 2.0;
+            eprintln!("drummer {:.0} bpm", drummer.bpm);
+        }
+        if key_edge(&window, Key::RightBracket, &mut rb_held) {
+            drummer.bpm += 2.0;
+            eprintln!("drummer {:.0} bpm", drummer.bpm);
+        }
+        // --- mouse as finger ------------------------------------------------------------
+        let down = window.get_mouse_down(MouseButton::Left);
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+            let (x, y) = (mx as i32, my as i32);
+            let ev = if down && !mouse_down {
+                Some(TouchEvent::Down { x, y, t: now })
+            } else if down {
+                Some(TouchEvent::Move { x, y, t: now })
+            } else if mouse_down {
+                Some(TouchEvent::Up { t: now })
+            } else {
+                None
+            };
+            mouse_down = down;
+            if let Some(ev) = ev {
+                let cur = mode;
+                let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+                session.touch(ev, cur, &mut act);
+            }
+        }
+        {
+            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+            session.tick(now, &mut act);
+        }
+        if mode == Mode::Auto {
+            live = tracker.grid();
+        }
+        *live_shared.lock().unwrap() = live;
+        if let Some(t) = seq_dirty {
+            if now - t > 1.0 {
+                seq_dirty = None;
+                if let Err(e) = seq.save(&seq_path) {
+                    eprintln!("save failed: {e}");
+                }
+            }
+        }
+        // Fake MIDI tick counter: 24 per beat while running.
+        if live.running {
+            let n = live.first_beat_at_or_after(now) - 1;
+            if n != last_tick_beat {
+                last_tick_beat = n;
+                ticks += 24;
+            }
+        }
+        // --- frame -------------------------------------------------------------------
+        if session.frame_due(now) {
+            let level = if drummer.playing { -14.0 + (drummer.rand() as f32) * 6.0 } else { -70.0 };
+            let st = Status {
+                mode,
+                live,
+                tracker: tracker.grid(),
+                tempo_strength: tracker.last_tempo_strength as f32,
+                level_db: level,
+                xruns: 0,
+                ticks,
+                late_max_us: 82,
+                midi: true,
+                taps: manual.taps(),
+                now,
+                seq: seq.clone(),
+            };
+            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+            if session.frame(now, &st, &mut act) {
+                for (p, b) in pixels.iter_mut().zip(session.canvas().bytes().chunks_exact(4)) {
+                    *p = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+            }
+        }
+        window.update_with_buffer(&pixels, w, h)?;
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    seq_stop.store(true, Ordering::Relaxed);
+    let _ = seq_thread.join();
+    Ok(())
+}
+
+/// The same mode/ownership rules as the application, without threads.
+#[allow(clippy::too_many_arguments)]
+fn apply(
+    a: Action,
+    mode: &mut Mode,
+    tracker: &mut Tracker,
+    manual: &mut ManualClock,
+    live: &mut Grid,
+    seq: &mut Arc<SeqState>,
+    seq_snapshot: &ArcSwap<sequencer::Snapshot>,
+    seq_dirty: &mut Option<f64>,
+    now: f64,
+) {
+    match a {
+        Action::Seq(sa) => {
+            if Arc::make_mut(seq).apply(sa) && !sa.view_only() {
+                seq_snapshot.store(Arc::new(seq.snapshot()));
+                *seq_dirty = Some(now);
+            }
+        }
+        Action::SetMode(Mode::Manual) => {
+            if *mode != Mode::Manual {
+                *mode = Mode::Manual;
+                manual.adopt(live);
+                *live = manual.grid();
+            }
+        }
+        Action::SetMode(Mode::Auto) => {
+            if *mode != Mode::Auto {
+                *mode = Mode::Auto;
+                tracker.adopt(*live, now);
+                *live = tracker.grid();
+            }
+        }
+        Action::Tap(t) => {
+            manual.tap(t);
+            *live = manual.grid();
+        }
+        Action::Nudge(d) => {
+            manual.nudge_bpm(d, now);
+            *live = manual.grid();
+        }
+        Action::ToggleRun => {
+            manual.toggle(now);
+            *live = manual.grid();
+        }
+        Action::Relock => {
+            tracker.relock();
+            *live = tracker.grid();
+        }
+    }
+}
