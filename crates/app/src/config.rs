@@ -165,6 +165,8 @@ impl Default for Tempo {
 #[serde(default)]
 pub struct Midi {
     pub enabled: bool,
+    /// Rawmidi port such as `hw:CARD=US2x2,0,0`, or `virtual` / `virtual:NAME`
+    /// for an ALSA sequencer port that other programs on the machine can subscribe to.
     pub device: String,
     /// Send every tick this much early.
     pub lead_ms: f64,

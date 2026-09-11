@@ -54,7 +54,7 @@ full_weight_strength = 6.0
 
 [midi]
 enabled = true
-device = "hw:CARD=US2x2,0,0"          # rawmidi port, see --list-devices
+device = "hw:CARD=US2x2,0,0"          # rawmidi port (see --list-devices) or "virtual" for an ALSA sequencer port
 lead_ms = 1.5                         # send each tick this early (USB + slave latency)
 send_start_stop = true
 

@@ -10,6 +10,7 @@ ui = { path = "../../crates/ui" }
 tracker = { path = "../../crates/tracker" }
 rtio = { path = "../../crates/rtio" }
 sequencer = { path = "../../crates/sequencer" }
+midiclock = { path = "../../crates/midiclock" }
 arc-swap.workspace = true
 clap.workspace = true
 anyhow.workspace = true

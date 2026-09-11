@@ -1,6 +1,10 @@
 //! Run the touch UI in a desktop window. The mouse is the finger, a virtual
 //! drummer feeds the real tracker so AUTO mode behaves like on stage.
 //!
+//! With `--midi virtual` the real clock and sequencer threads send MIDI
+//! clock and notes to an ALSA sequencer port that other programs on the same
+//! machine (Bitwig, `aseqdump`) can subscribe to.
+//!
 //! Keys:  D  drummer on/off      [ ]  drummer tempo -/+ 2 BPM
 //!        J  toggle 15 ms timing jitter     Q / Esc  quit
 
@@ -14,19 +18,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use rtio::MidiOut;
 use sequencer::{NoteOut, SeqState, SeqStats};
 use tracker::{Grid, HopInput, ManualClock, ManualConfig, Tracker, TrackerConfig};
 use ui::{Action, Canvas, Mode, PixelFormat, Rotation, Session, Status, TouchEvent, UiConfig};
 
-/// Notes go to stderr instead of a MIDI port.
-struct PrintNotes;
-impl NoteOut for PrintNotes {
+/// Notes go to the MIDI port if there is one, and to stderr if asked.
+struct SimNotes {
+    midi: Option<Arc<MidiOut>>,
+    print: bool,
+}
+impl NoteOut for SimNotes {
     fn note_on(&self, channel: u8, note: u8, vel: u8) -> bool {
-        eprintln!("note on  ch{:2} {:>4} vel {vel}", channel + 1, sequencer::note_name(note));
-        true
+        if self.print {
+            eprintln!("note on  ch{:2} {:>4} vel {vel}", channel + 1, sequencer::note_name(note));
+        }
+        self.midi.as_ref().is_none_or(|m| m.note_on(channel, note, vel).is_ok())
     }
-    fn note_off(&self, _channel: u8, _note: u8) -> bool {
-        true
+    fn note_off(&self, channel: u8, note: u8) -> bool {
+        self.midi.as_ref().is_none_or(|m| m.note_off(channel, note).is_ok())
     }
 }
 
@@ -54,6 +64,16 @@ struct Args {
     /// Print sequencer notes to stderr as they are sent.
     #[arg(long)]
     print_notes: bool,
+    /// Send MIDI clock and sequencer notes for real: `virtual` creates an ALSA
+    /// sequencer port "midi-clock:out" that Bitwig etc. can connect to
+    /// (`virtual:NAME` picks the client name), `hw:...` uses a rawmidi port.
+    #[arg(long)]
+    midi: Option<String>,
+    /// With `--midi virtual`: connect the port to this ALSA sequencer input at
+    /// start, like `aconnect`. A client name or part of it (`virmidi`,
+    /// `"Virtual Raw MIDI 1-0"`), or `CLIENT:PORT` numbers.
+    #[arg(long)]
+    connect: Vec<String>,
 }
 
 /// A drummer that hits every beat, feeding hops to the tracker like the audio thread does.
@@ -119,34 +139,42 @@ fn main() -> Result<()> {
     let mut drummer = Drummer { playing: args.drummer, bpm: args.drummer_bpm, jitter: false, next_beat: t0 + 1.0, hop_time: t0, seed: 42 };
     let live_shared = Arc::new(Mutex::new(if mode == Mode::Manual { manual.grid() } else { tracker.grid() }));
     let mut live: Grid = *live_shared.lock().unwrap();
-    // Sequencer: real thread, notes printed instead of sent.
+    // Real MIDI output when asked for; the clock thread is the one from the app.
+    let midi_out = match &args.midi {
+        Some(name) => {
+            let m = Arc::new(MidiOut::open(name)?);
+            eprintln!("midi: {}", m.name());
+            for dest in &args.connect {
+                m.connect(dest)?;
+                eprintln!("midi: connected to {dest}");
+            }
+            Some(m)
+        }
+        None => None,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let clock_stats = Arc::new(midiclock::ClockStats::default());
+    let clock_thread = midi_out.clone().map(|midi| {
+        let live = live_shared.clone();
+        let stop = stop.clone();
+        let stats = clock_stats.clone();
+        let ccfg = midiclock::ClockConfig { lead_s: 0.0, send_start_stop: true };
+        std::thread::spawn(move || midiclock::run(|| *live.lock().unwrap(), &midi, &ccfg, &stop, &stats))
+    });
+    // Sequencer: real thread, notes to the MIDI port and/or stderr.
     let seq_path = args.patterns.clone();
     let mut seq = Arc::new(if seq_path.exists() { SeqState::load(&seq_path).unwrap_or_default() } else { SeqState::default() });
     let mut seq_dirty: Option<f64> = None;
     let seq_snapshot = Arc::new(ArcSwap::from_pointee(seq.snapshot()));
-    let seq_stop = Arc::new(AtomicBool::new(false));
     let seq_thread = {
         let live = live_shared.clone();
         let snap = seq_snapshot.clone();
-        let stop = seq_stop.clone();
-        let print = args.print_notes;
+        let stop = stop.clone();
+        let out = SimNotes { midi: midi_out.clone(), print: args.print_notes };
         std::thread::spawn(move || {
-            struct Quiet;
-            impl NoteOut for Quiet {
-                fn note_on(&self, _: u8, _: u8, _: u8) -> bool {
-                    true
-                }
-                fn note_off(&self, _: u8, _: u8) -> bool {
-                    true
-                }
-            }
             let stats = SeqStats::default();
             let get_grid = || *live.lock().unwrap();
-            if print {
-                sequencer::run(get_grid, || snap.load_full(), &PrintNotes, 0.0, &stop, &stats);
-            } else {
-                sequencer::run(get_grid, || snap.load_full(), &Quiet, 0.0, &stop, &stats);
-            }
+            sequencer::run(get_grid, || snap.load_full(), &out, 0.0, &stop, &stats);
         })
     };
     let mut ticks = 0u64;
@@ -221,8 +249,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        // Fake MIDI tick counter: 24 per beat while running.
-        if live.running {
+        // Fake MIDI tick counter (24 per beat while running) when there is no real clock thread.
+        if midi_out.is_none() && live.running {
             let n = live.first_beat_at_or_after(now) - 1;
             if n != last_tick_beat {
                 last_tick_beat = n;
@@ -232,6 +260,11 @@ fn main() -> Result<()> {
         // --- frame -------------------------------------------------------------------
         if session.frame_due(now) {
             let level = if drummer.playing { -14.0 + (drummer.rand() as f32) * 6.0 } else { -70.0 };
+            let (ticks, late_max_us) = if midi_out.is_some() {
+                (clock_stats.ticks.load(Ordering::Relaxed), clock_stats.late_max_us.load(Ordering::Relaxed))
+            } else {
+                (ticks, 82)
+            };
             let st = Status {
                 mode,
                 live,
@@ -240,7 +273,7 @@ fn main() -> Result<()> {
                 level_db: level,
                 xruns: 0,
                 ticks,
-                late_max_us: 82,
+                late_max_us,
                 midi: true,
                 taps: manual.taps(),
                 now,
@@ -256,8 +289,12 @@ fn main() -> Result<()> {
         window.update_with_buffer(&pixels, w, h)?;
         std::thread::sleep(Duration::from_millis(4));
     }
-    seq_stop.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     let _ = seq_thread.join();
+    if let Some(t) = clock_thread {
+        let _ = t.join();
+        eprintln!("midi clock: {}", clock_stats.summary());
+    }
     Ok(())
 }
 

@@ -13,7 +13,7 @@ are emitted before the hit is heard. See [PLAN.md](PLAN.md) for the rationale.
 
 | Path | What |
 |---|---|
-| `crates/rtio` | Raw ALSA duplex PCM with per-period timestamps, rawmidi output, SCHED_FIFO helpers |
+| `crates/rtio` | Raw ALSA duplex PCM with per-period timestamps, MIDI output (rawmidi or an ALSA sequencer port), SCHED_FIFO helpers |
 | `crates/onset` | Drum-aware onset detection function (log spectral flux + kick and snare bands) |
 | `crates/tracker` | Tempo estimation (comb-filtered autocorrelation), phase-locked beat grid, state machine |
 | `crates/click` | Sample-accurate click rendered from the grid |
@@ -223,7 +223,37 @@ real tracker so AUTO mode locks, coasts and stops as on stage. The real
 sequencer thread runs too; `--print-notes` logs its notes to stderr and
 `--patterns FILE` picks the pattern file (default `patterns.toml` in the
 current directory). Keys: `D` drummer on/off, `[` / `]` drummer tempo, `J`
-timing jitter, `Q` quit. The screen lives in `crates/ui/src/screen.rs`
+timing jitter, `Q` quit.
+
+To drive real synths and drum machines on the same machine, send the MIDI
+for real:
+
+```sh
+cargo run --release -p uisim -- --drummer --midi virtual
+```
+
+This runs the clock thread from the application and creates an ALSA
+sequencer port `midi-clock:out` that carries clock, Start/Stop and the
+sequencer's notes. `aseqdump -p midi-clock:0` prints what goes out,
+`aconnect midi-clock:0 <client:port>` wires it to any sequencer client, and
+`--connect NAME` does that at start (`NAME` is a client name or part of it,
+or `CLIENT:PORT` numbers). `--midi virtual:NAME` names the client
+differently, `--midi hw:1,0,0` uses a rawmidi port instead. The screen's
+tick counter and lateness then show the real clock thread.
+
+Bitwig on Linux only lists rawmidi devices, not sequencer ports. The
+`snd-virmidi` kernel module provides devices that are both, so wire the
+simulator to one of them:
+
+```sh
+sudo modprobe snd-virmidi midi_devs=1        # once per boot; a file in
+                                              # /etc/modules-load.d makes it permanent
+cargo run --release -p uisim -- --drummer --midi virtual --connect virmidi
+```
+
+Bitwig then shows a *VirMIDI* device: add a *Generic MIDI Keyboard* (notes)
+or a *Generic Controller* set up as a clock slave and pick it as the input.
+The screen lives in `crates/ui/src/screen.rs`
 (layout, colours, `View`), the touch/redraw logic in `Session` in
 `crates/ui/src/lib.rs`, the sequencer model in `crates/sequencer`; edit,
 rerun, then `rsync` to the Pi and rebuild there.

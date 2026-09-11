@@ -860,7 +860,10 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
 ) {
     let poll = 0.0015;
     let mut pending: Vec<Pending> = Vec::with_capacity(TRACKS * 8 + 1);
-    let mut last_q: Option<i64> = None;
+    // Last 16th played, as an absolute index (beat * 4 + 16th). Absolute, not
+    // relative to `n0`: the tracker re-anchors `n0`/`t0` every tempo
+    // estimate while beat numbers stay put.
+    let mut last_a: Option<i64> = None;
     let mut epoch = u32::MAX;
     let all_off = |pending: &mut Vec<Pending>| {
         for p in pending.drain(..) {
@@ -899,28 +902,28 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                     }
                 });
             }
-            last_q = None;
+            last_a = None;
             sleep_until(tnow + 0.002);
             continue;
         }
         if g.epoch != epoch {
             epoch = g.epoch;
-            last_q = None;
+            last_a = None;
         }
-        // Next 16th at or after now + lead, in 16ths relative to the grid's n0.
+        // Next 16th at or after now + lead, as an absolute 16th index.
         let step_len = g.period / 4.0;
-        let mut q = ((tnow + lead_s - g.t0) / step_len).ceil() as i64;
-        if let Some(lq) = last_q {
-            if q <= lq {
-                q = lq + 1;
+        let mut a = g.n0 * 4 + ((tnow + lead_s - g.t0) / step_len).ceil() as i64;
+        if let Some(la) = last_a {
+            if a <= la {
+                a = la + 1;
             }
-            if q > lq + 2 * STEPS as i64 {
+            if a > la + 2 * STEPS as i64 {
                 // The grid jumped far ahead; do not burst.
-                last_q = None;
+                last_a = None;
             }
         }
-        let n = g.n0 + q.div_euclid(4);
-        let sub = q.rem_euclid(4);
+        let n = a.div_euclid(4);
+        let sub = a.rem_euclid(4);
         let t_on = g.tick_time(n, (sub * 6) as u32) - lead_s;
         let next = t_on.min(next_off);
         if next - tnow > poll {
@@ -944,8 +947,8 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
             let (bar, k) = bar_and_step(&g, n, sub);
             // Note-off `len` steps on: beat, 16th and time on this grid.
             let off = |len: u16| {
-                let q_off = q + len.max(1) as i64;
-                let (n_off, sub_off) = (g.n0 + q_off.div_euclid(4), q_off.rem_euclid(4));
+                let a_off = a + len.max(1) as i64;
+                let (n_off, sub_off) = (a_off.div_euclid(4), a_off.rem_euclid(4));
                 (n_off, sub_off, g.tick_time(n_off, (sub_off * 6) as u32) - lead_s)
             };
             let pidx = bar.rem_euclid(snap.pattern.bars.max(1) as i64) as usize * STEPS + k;
@@ -998,7 +1001,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                     let _ = midi.note_off(b.channel, st.note);
                 }
             }
-            last_q = Some(q);
+            last_a = Some(a);
         }
     }
 }
@@ -1263,6 +1266,40 @@ mod tests {
         assert!((snare_off.0 - (t0 + 5.0 * 0.0625)).abs() < 0.004, "len: {}", snare_off.0 - t0);
         let kick_offs: Vec<f64> = offs.iter().filter(|e| e.3 == 36).map(|e| e.0 - t0).collect();
         assert!(kick_offs.iter().any(|&t| (t - 11.0 * 0.0625).abs() < 0.004), "long kick off: {kick_offs:?}");
+    }
+
+    #[test]
+    fn follows_a_grid_that_re_anchors_every_beat() {
+        // The tracker moves n0/t0 to the most recent beat on every tempo
+        // estimate. Beat numbers stay put, so the sequencer must keep firing.
+        let mut st = SeqState::default();
+        st.apply(SeqAction::ToggleStep(0, 0));
+        st.apply(SeqAction::ToggleStep(0, 4));
+        st.apply(SeqAction::ToggleStep(0, 8));
+        st.apply(SeqAction::ToggleStep(0, 12));
+        let snap = std::sync::Arc::new(st.snapshot());
+        let t0 = now() + 0.05;
+        let base = Grid { running: true, epoch: 1, t0, n0: 0, period: 0.25, ..Grid::default() };
+        let get_grid = || {
+            let (n, _) = base.nearest_beat(now());
+            Grid { t0: base.beat_time(n), n0: n, ..base }
+        };
+        let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+        let stop = AtomicBool::new(false);
+        let stats = SeqStats::default();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sleep_until(t0 + 1.02);
+                stop.store(true, Ordering::Relaxed);
+            });
+            run(get_grid, || snap.clone(), &rec, 0.0, &stop, &stats);
+        });
+        let ev = rec.0.into_inner().unwrap();
+        let ons: Vec<f64> = ev.iter().filter(|e| e.1).map(|e| e.0 - t0).collect();
+        assert_eq!(ons.len(), 5, "{ons:?}");
+        for (i, t) in ons.iter().enumerate() {
+            assert!((t - i as f64 * 0.25).abs() < 0.003, "beat {i}: {t}");
+        }
     }
 
     #[test]
