@@ -76,7 +76,24 @@ pub struct Session {
     /// Finger dragging the bass note names: y at which the last semitone was
     /// scrolled.
     drag_y: Option<i32>,
+    /// Finger dragging a note's length on the sequence or bass grid.
+    cell_drag: Option<CellDrag>,
 }
+
+#[derive(Clone, Copy)]
+struct CellDrag {
+    bass: bool,
+    /// Column last reported to the sequencer.
+    col: usize,
+    /// +1/-1 while the finger is at the right/left edge of the grid, and
+    /// since when: held there, the drag moves on to the next/previous bar.
+    edge: i32,
+    edge_since: f64,
+}
+
+/// How long the finger stays at the edge of the grid before the drag moves
+/// on to the next bar (and again for every further bar).
+const EDGE_HOLD_S: f64 = 0.6;
 
 impl Session {
     pub fn new(cfg: &UiConfig, canvas: Canvas) -> Self {
@@ -94,6 +111,7 @@ impl Session {
             next_frame: 0.0,
             page: Page::Tempo,
             drag_y: None,
+            cell_drag: None,
         }
     }
 
@@ -122,6 +140,7 @@ impl Session {
                 self.finger = Some((lx, ly));
                 self.pressed = None;
                 self.drag_y = None;
+                self.cell_drag = None;
                 self.press_t = t;
                 self.last_repeat = t;
                 match self.screen.hit(lx, ly, self.page) {
@@ -134,14 +153,20 @@ impl Session {
                             dispatch(b, t - self.tap_offset_s, act);
                         }
                     }
-                    Some(Hit::Cell(track, step)) => act(Action::Seq(SeqAction::ToggleStep(track, step))),
+                    Some(Hit::Cell(track, step)) => {
+                        act(Action::Seq(SeqAction::CellDown(track, step)));
+                        self.cell_drag = Some(CellDrag { bass: false, col: step, edge: 0, edge_since: t });
+                    }
                     Some(Hit::Track(track)) => act(Action::Seq(SeqAction::SelectTrack(track))),
-                    Some(Hit::BassCell(row, step)) => act(Action::Seq(SeqAction::BassSet(row, step))),
+                    Some(Hit::BassCell(row, step)) => {
+                        act(Action::Seq(SeqAction::BassCellDown(row, step)));
+                        self.cell_drag = Some(CellDrag { bass: true, col: step, edge: 0, edge_since: t });
+                    }
                     Some(Hit::BassLabels) => self.drag_y = Some(ly),
                     None => {}
                 }
             }
-            TouchEvent::Move { x, y, .. } => {
+            TouchEvent::Move { x, y, t } => {
                 let (lx, ly) = self.canvas.touch_to_logical(x, y);
                 self.finger = Some((lx, ly));
                 if let Some(b) = self.pressed {
@@ -159,11 +184,28 @@ impl Session {
                         self.drag_y = Some(y0 + rows * pitch);
                     }
                 }
+                // Dragging along a grid row sets the note's length: the note
+                // ends on the column under the finger.
+                if let Some(cd) = &mut self.cell_drag {
+                    let col = self.screen.column_at(lx, cd.bass);
+                    if col != cd.col {
+                        cd.col = col;
+                        act(Action::Seq(if cd.bass { SeqAction::BassCellDrag(col) } else { SeqAction::CellDrag(col) }));
+                    }
+                    let edge = self.screen.grid_edge(lx, cd.bass);
+                    if edge != cd.edge {
+                        cd.edge = edge;
+                        cd.edge_since = t;
+                    }
+                }
             }
             TouchEvent::Up { .. } => {
                 self.pressed = None;
                 self.finger = None;
                 self.drag_y = None;
+                if let Some(cd) = self.cell_drag.take() {
+                    act(Action::Seq(if cd.bass { SeqAction::BassCellUp } else { SeqAction::CellUp }));
+                }
             }
         }
     }
@@ -173,14 +215,23 @@ impl Session {
         self.pressed = None;
         self.finger = None;
         self.drag_y = None;
+        self.cell_drag = None;
     }
 
-    /// Auto-repeat for held +/- buttons. Call often.
+    /// Auto-repeat for held +/- buttons, and a note drag held at the edge
+    /// of the grid moving on to the next bar. Call often.
     pub fn tick(&mut self, now: f64, act: &mut impl FnMut(Action)) {
         if let Some(b) = self.pressed {
             if b.repeats() && now - self.press_t > 0.45 && now - self.last_repeat > 0.12 {
                 self.last_repeat = now;
                 dispatch(b, now, act);
+            }
+        }
+        if let Some(cd) = &mut self.cell_drag {
+            if cd.edge != 0 && now - cd.edge_since > EDGE_HOLD_S {
+                cd.edge_since = now;
+                cd.col = if cd.edge > 0 { sequencer::STEPS - 1 } else { 0 };
+                act(Action::Seq(if cd.bass { SeqAction::BassCellDragBar(cd.edge) } else { SeqAction::CellDragBar(cd.edge) }));
             }
         }
     }

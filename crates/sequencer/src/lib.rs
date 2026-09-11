@@ -33,12 +33,21 @@ pub struct Step {
     pub on: bool,
     pub note: u8,
     pub vel: u8,
+    /// Length in steps (1..=MAX_STEPS); the note-off lands on the grid `len`
+    /// steps after the note-on. May run past the bar and past the end of
+    /// the phrase (it then wraps).
+    #[serde(default = "one_step")]
+    pub len: u16,
 }
 
 impl Default for Step {
     fn default() -> Self {
-        Self { on: false, note: 60, vel: 100 }
+        Self { on: false, note: 60, vel: 100, len: 1 }
     }
+}
+
+fn one_step() -> u16 {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,8 +57,6 @@ pub struct Track {
     /// Note new steps get.
     pub note: u8,
     pub vel: u8,
-    /// Gate length as percent of a step (10..=100).
-    pub gate: u8,
     pub muted: bool,
     /// `MAX_STEPS` steps; only the pattern's `bars` bars play.
     pub steps: Vec<Step>,
@@ -57,7 +64,7 @@ pub struct Track {
 
 impl Track {
     pub fn new(channel: u8, note: u8) -> Self {
-        Self { channel, note, vel: 100, gate: 50, muted: false, steps: vec![Step::default(); MAX_STEPS] }
+        Self { channel, note, vel: 100, muted: false, steps: vec![Step::default(); MAX_STEPS] }
     }
 }
 
@@ -89,7 +96,9 @@ impl Pattern {
         self.tracks.resize_with(TRACKS, || Track::new(9, 60));
         for t in &mut self.tracks {
             t.steps.resize(MAX_STEPS, Step::default());
-            t.gate = t.gate.clamp(10, 100);
+            for st in &mut t.steps {
+                st.len = st.len.clamp(1, MAX_STEPS as u16);
+            }
             t.channel &= 0x0F;
             t.note &= 0x7F;
             t.vel = t.vel.clamp(1, 127);
@@ -101,24 +110,24 @@ impl Pattern {
 pub struct BassStep {
     pub on: bool,
     pub note: u8,
+    /// Length in steps, as `Step::len`.
+    #[serde(default = "one_step")]
+    pub len: u16,
 }
 
 impl Default for BassStep {
     fn default() -> Self {
-        Self { on: false, note: 36 }
+        Self { on: false, note: 36, len: 1 }
     }
 }
 
-/// The single-voice bass line: up to 8 bars of 16ths, one note per step.
-/// A new note always ends the previous one (monophonic).
+/// The single-voice bass line: up to 8 bars of 16ths, one note per step,
+/// each with a length. A new note always ends the previous one (monophonic).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bass {
     /// MIDI channel, 0-based.
     pub channel: u8,
     pub vel: u8,
-    /// Gate in percent of a step, 10..=400: a note may ring into the
-    /// following steps until the next note cuts it.
-    pub gate: u16,
     /// Phrase length in bars: 1, 2, 4 or 8.
     pub bars: u8,
     /// Lowest note of the pitch window shown on screen (`BASS_ROWS` semitones).
@@ -129,7 +138,7 @@ pub struct Bass {
 
 impl Default for Bass {
     fn default() -> Self {
-        Self { channel: 0, vel: 100, gate: 80, bars: 2, base: 36, steps: vec![BassStep::default(); MAX_STEPS] }
+        Self { channel: 0, vel: 100, bars: 2, base: 36, steps: vec![BassStep::default(); MAX_STEPS] }
     }
 }
 
@@ -138,10 +147,10 @@ impl Bass {
         self.steps.resize(MAX_STEPS, BassStep::default());
         for st in &mut self.steps {
             st.note &= 0x7F;
+            st.len = st.len.clamp(1, MAX_STEPS as u16);
         }
         self.channel &= 0x0F;
         self.vel = self.vel.clamp(1, 127);
-        self.gate = self.gate.clamp(10, 400);
         if !matches!(self.bars, 1 | 2 | 4 | 8) {
             self.bars = 1;
         }
@@ -163,7 +172,6 @@ pub enum Param {
     Channel,
     Note,
     Velocity,
-    Gate,
 }
 
 /// Which bass parameter a +/- press changes.
@@ -171,13 +179,30 @@ pub enum Param {
 pub enum BassParam {
     Channel,
     Velocity,
-    Gate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SeqAction {
-    /// Set or clear step `step` of the shown bar on track `track`.
+    /// A tap on step `step` of the shown bar on track `track`: `CellDown`
+    /// followed by `CellUp`.
     ToggleStep(usize, usize),
+    /// Finger down on a cell (track, step of the shown bar). An empty cell
+    /// gets a one-step note; a cell inside a longer note (its tail) gets a
+    /// new note that cuts the old one; the head of a note starts a drag
+    /// and clears the note if the finger lifts without moving.
+    CellDown(usize, usize),
+    /// The finger moved to this step of the drag's bar (the bar the drag
+    /// started in, moved by `CellDragBar`): the note being dragged now ends
+    /// there. Dragging left of the head makes it one step; a following note
+    /// caps the length.
+    CellDrag(usize),
+    /// The finger is held at the right (+1) or left (-1) edge of the grid:
+    /// the drag moves on to the next (previous) bar, which is shown and
+    /// locked, and the note ends at the finger's column there. Past the end
+    /// of the phrase the drag wraps to its first bar.
+    CellDragBar(i32),
+    /// Finger up: a tap on a note's head clears it.
+    CellUp,
     SelectTrack(usize),
     SelectPattern(usize),
     /// Phrase length of the current pattern in bars (1, 2, 4 or 8).
@@ -196,9 +221,18 @@ pub enum SeqAction {
     ToggleEdit,
     /// Clear the selected track (or the selected step in edit mode).
     Clear,
-    /// Bass: set step `step` of the shown bar to the note in pitch row `row`
-    /// (0 = the shown base note); the same cell again clears the step.
+    /// Bass: a tap on step `step` of the shown bar in pitch row `row`
+    /// (0 = the shown base note): `BassCellDown` followed by `BassCellUp`.
+    /// The same cell again clears the note; another row moves it.
     BassSet(usize, usize),
+    /// Bass: as `CellDown`, in pitch row `row`.
+    BassCellDown(usize, usize),
+    /// Bass: as `CellDrag`.
+    BassCellDrag(usize),
+    /// Bass: as `CellDragBar`.
+    BassCellDragBar(i32),
+    /// Bass: as `CellUp`.
+    BassCellUp,
     /// Bass: phrase length in bars (1, 2, 4 or 8).
     BassBars(u8),
     /// Bass: which bar the screen shows and edits (and stays on).
@@ -257,6 +291,28 @@ pub struct SeqState {
     pub bass_bar: usize,
     /// As `bar_lock`, for the bass page.
     pub bass_bar_lock: bool,
+    /// A finger dragging a note's length on one of the grids.
+    drag: Option<Drag>,
+}
+
+/// A note whose length is being dragged. `head` is its absolute step.
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    bass: bool,
+    track: usize,
+    head: usize,
+    /// Absolute step the finger went down on (the head, or a step inside
+    /// the note) and, for the bass, the note of its row.
+    cell: usize,
+    note: u8,
+    /// Bar the drag columns are in, counted on from the head's bar without
+    /// wrapping (bar `bars` is the phrase's first bar again), so a note can
+    /// be dragged around the end of the phrase.
+    bar: i64,
+    moved: bool,
+    /// The finger went down on the note's head: lifting it without moving
+    /// clears the note.
+    tap_clears: bool,
 }
 
 impl Default for SeqState {
@@ -273,6 +329,7 @@ impl Default for SeqState {
             bass: Bass::default(),
             bass_bar: 0,
             bass_bar_lock: false,
+            drag: None,
         }
     }
 }
@@ -317,21 +374,91 @@ impl SeqState {
         let cur = self.current;
         match a {
             SeqAction::ToggleStep(t, k) => {
+                let a = self.apply(SeqAction::CellDown(t, k));
+                self.apply(SeqAction::CellUp) || a
+            }
+            SeqAction::CellDown(t, k) => {
                 if t >= TRACKS || k >= STEPS {
                     return false;
                 }
                 self.track = t;
-                let idx = self.shown_bar() * STEPS + k;
+                self.drag = None;
+                let bar = self.shown_bar();
+                let idx = bar * STEPS + k;
                 if self.edit {
                     self.selected_step = Some(idx);
                     return true;
                 }
+                let n = phrase_steps(self.patterns[cur].bars);
                 let tr = &mut self.patterns[cur].tracks[t];
-                let st = &mut tr.steps[idx];
-                if st.on {
-                    st.on = false;
+                let cover = cover_map(|i| tr.steps[i].on.then_some(tr.steps[i].len as usize), n);
+                let drag = Drag { bass: false, track: t, head: idx, cell: idx, note: tr.note, bar: bar as i64, moved: false, tap_clears: false };
+                match cover[idx] {
+                    Some(h) if h as usize == idx => {
+                        self.drag = Some(Drag { tap_clears: true, ..drag });
+                        false
+                    }
+                    Some(h) => {
+                        // inside a note: a new one that cuts it ... (a tap), or
+                        // dragging its tail: decided by whether the finger moves
+                        self.drag = Some(Drag { head: h as usize, bar: drag_bar(h as usize, bar, n), ..drag });
+                        false
+                    }
+                    None => {
+                        tr.steps[idx] = Step { on: true, note: tr.note, vel: tr.vel, len: 1 };
+                        self.drag = Some(drag);
+                        true
+                    }
+                }
+            }
+            SeqAction::CellDrag(k) => {
+                let Some(d) = self.drag.filter(|d| !d.bass) else {
+                    return false;
+                };
+                if k >= STEPS {
+                    return false;
+                }
+                let n = phrase_steps(self.patterns[cur].bars);
+                let tr = &mut self.patterns[cur].tracks[d.track];
+                let len = drag_len(d, k, n, |i| tr.steps[i].on);
+                self.drag = Some(Drag { moved: true, ..d });
+                if tr.steps[d.head].len == len {
+                    return false;
+                }
+                tr.steps[d.head].len = len;
+                true
+            }
+            SeqAction::CellDragBar(dir) => {
+                let Some(d) = self.drag.filter(|d| !d.bass) else {
+                    return false;
+                };
+                let n = phrase_steps(self.patterns[cur].bars);
+                let Some(bar) = drag_bar_step(d, dir, n) else {
+                    return false;
+                };
+                self.bar = bar.rem_euclid((n / STEPS) as i64) as usize;
+                self.bar_lock = true;
+                self.drag = Some(Drag { bar, ..d });
+                self.apply(SeqAction::CellDrag(if dir > 0 { STEPS - 1 } else { 0 }));
+                true
+            }
+            SeqAction::CellUp => {
+                let Some(d) = self.drag.take().filter(|d| !d.bass) else {
+                    return false;
+                };
+                if d.moved {
+                    return false;
+                }
+                let n = phrase_steps(self.patterns[cur].bars);
+                let tr = &mut self.patterns[cur].tracks[d.track];
+                if d.tap_clears {
+                    tr.steps[d.head].on = false;
+                } else if d.cell != d.head {
+                    // a tap inside a note: a new note there cuts it
+                    tr.steps[d.head].len = ((d.cell + n - d.head) % n).max(1) as u16;
+                    tr.steps[d.cell] = Step { on: true, note: tr.note, vel: tr.vel, len: 1 };
                 } else {
-                    *st = Step { on: true, note: tr.note, vel: tr.vel };
+                    return false;
                 }
                 true
             }
@@ -355,6 +482,7 @@ impl SeqState {
                 if !matches!(n, 1 | 2 | 4 | 8) {
                     return false;
                 }
+                self.drag = None;
                 let old = self.patterns[cur].bars.max(1) as usize;
                 for t in &mut self.patterns[cur].tracks {
                     extend_bars(&mut t.steps, old, n as usize);
@@ -395,7 +523,6 @@ impl SeqState {
                     (Param::Note, None) => tr.note = bump(tr.note, 0, 127),
                     (Param::Velocity, None) => tr.vel = bump(tr.vel, 1, 127),
                     (Param::Channel, _) => tr.channel = bump(tr.channel, 0, 15),
-                    (Param::Gate, _) => tr.gate = bump(tr.gate, 10, 100),
                 }
                 true
             }
@@ -428,16 +555,94 @@ impl SeqState {
                 true
             }
             SeqAction::BassSet(row, k) => {
+                let a = self.apply(SeqAction::BassCellDown(row, k));
+                self.apply(SeqAction::BassCellUp) || a
+            }
+            SeqAction::BassCellDown(row, k) => {
                 if row >= BASS_ROWS || k >= STEPS {
                     return false;
                 }
+                self.drag = None;
                 let bar = self.bass_bar.min(self.bass.bars as usize - 1);
+                let idx = bar * STEPS + k;
                 let note = (self.bass.base + row as u8).min(127);
-                let st = &mut self.bass.steps[bar * STEPS + k];
-                if st.on && st.note == note {
-                    st.on = false;
+                let n = phrase_steps(self.bass.bars);
+                let b = &mut self.bass;
+                let cover = cover_map(|i| b.steps[i].on.then_some(b.steps[i].len as usize), n);
+                let drag = Drag { bass: true, track: 0, head: idx, cell: idx, note, bar: bar as i64, moved: false, tap_clears: false };
+                match cover[idx] {
+                    Some(h) if h as usize == idx && b.steps[idx].note == note => {
+                        self.drag = Some(Drag { tap_clears: true, ..drag });
+                        false
+                    }
+                    Some(h) if h as usize == idx => {
+                        // another row on the head: move the note, keep its length
+                        b.steps[idx].note = note;
+                        self.drag = Some(drag);
+                        true
+                    }
+                    Some(h) if b.steps[h as usize].note == note => {
+                        // inside the note's own row: drag its tail, or cut it with a tap
+                        self.drag = Some(Drag { head: h as usize, bar: drag_bar(h as usize, bar, n), ..drag });
+                        false
+                    }
+                    covering => {
+                        if let Some(h) = covering {
+                            b.steps[h as usize].len = ((idx + n - h as usize) % n).max(1) as u16;
+                        }
+                        b.steps[idx] = BassStep { on: true, note, len: 1 };
+                        self.drag = Some(drag);
+                        true
+                    }
+                }
+            }
+            SeqAction::BassCellDrag(k) => {
+                let Some(d) = self.drag.filter(|d| d.bass) else {
+                    return false;
+                };
+                if k >= STEPS {
+                    return false;
+                }
+                let n = phrase_steps(self.bass.bars);
+                let b = &mut self.bass;
+                let len = drag_len(d, k, n, |i| b.steps[i].on);
+                self.drag = Some(Drag { moved: true, ..d });
+                if b.steps[d.head].len == len {
+                    return false;
+                }
+                b.steps[d.head].len = len;
+                true
+            }
+            SeqAction::BassCellDragBar(dir) => {
+                let Some(d) = self.drag.filter(|d| d.bass) else {
+                    return false;
+                };
+                let n = phrase_steps(self.bass.bars);
+                let Some(bar) = drag_bar_step(d, dir, n) else {
+                    return false;
+                };
+                self.bass_bar = bar.rem_euclid((n / STEPS) as i64) as usize;
+                self.bass_bar_lock = true;
+                self.drag = Some(Drag { bar, ..d });
+                self.apply(SeqAction::BassCellDrag(if dir > 0 { STEPS - 1 } else { 0 }));
+                true
+            }
+            SeqAction::BassCellUp => {
+                let Some(d) = self.drag.take().filter(|d| d.bass) else {
+                    return false;
+                };
+                if d.moved {
+                    return false;
+                }
+                let n = phrase_steps(self.bass.bars);
+                let b = &mut self.bass;
+                if d.tap_clears {
+                    b.steps[d.head].on = false;
+                } else if d.cell != d.head {
+                    b.steps[d.head].len = ((d.cell + n - d.head) % n).max(1) as u16;
+                    b.steps[d.cell] = BassStep { on: true, note: d.note, len: 1 };
                 } else {
-                    *st = BassStep { on: true, note };
+                    return false;
                 }
                 true
             }
@@ -445,6 +650,7 @@ impl SeqState {
                 if !matches!(n, 1 | 2 | 4 | 8) {
                     return false;
                 }
+                self.drag = None;
                 extend_bars(&mut self.bass.steps, self.bass.bars.max(1) as usize, n as usize);
                 self.bass.bars = n;
                 self.bass_bar = self.bass_bar.min(n as usize - 1);
@@ -474,7 +680,6 @@ impl SeqState {
                 match param {
                     BassParam::Channel => b.channel = (b.channel as i32 + d).clamp(0, 15) as u8,
                     BassParam::Velocity => b.vel = (b.vel as i32 + d).clamp(1, 127) as u8,
-                    BassParam::Gate => b.gate = (b.gate as i32 + 10 * d).clamp(10, 400) as u16,
                 }
                 true
             }
@@ -502,6 +707,68 @@ fn extend_bars<T: Clone>(steps: &mut [T], old: usize, new: usize) {
         let (head, tail) = steps.split_at_mut(bar * STEPS);
         tail[..STEPS].clone_from_slice(&head[src * STEPS..(src + 1) * STEPS]);
     }
+}
+
+/// Steps in a phrase of `bars` bars.
+pub fn phrase_steps(bars: u8) -> usize {
+    bars.clamp(1, MAX_BARS as u8) as usize * STEPS
+}
+
+/// Which note sounds on each step of a phrase of `n` steps: the absolute
+/// step of the note's head, for the head itself and for the steps its
+/// length covers (wrapping at the end of the phrase). A note ends where
+/// the next one starts. `on_len` gives the length of the note starting at a
+/// step, or `None` if none does.
+pub fn cover_map(on_len: impl Fn(usize) -> Option<usize>, n: usize) -> [Option<u16>; MAX_STEPS] {
+    let n = n.clamp(1, MAX_STEPS);
+    let mut map = [None; MAX_STEPS];
+    for (i, m) in map.iter_mut().enumerate().take(n) {
+        if on_len(i).is_some() {
+            *m = Some(i as u16);
+        }
+    }
+    for i in 0..n {
+        let Some(len) = on_len(i) else { continue };
+        for j in 1..len.min(n) {
+            let c = (i + j) % n;
+            if map[c].is_some() {
+                break;
+            }
+            map[c] = Some(i as u16);
+        }
+    }
+    map
+}
+
+/// The drag bar (see `Drag::bar`) for a finger on a step inside the note
+/// with head `head`, in bar `bar` of a phrase of `n` steps: the bar itself
+/// when it comes after the head's bar, a phrase later when the note wrapped
+/// around the end of the phrase to get there.
+fn drag_bar(head: usize, bar: usize, n: usize) -> i64 {
+    if bar * STEPS > head {
+        bar as i64
+    } else {
+        (bar + n / STEPS) as i64
+    }
+}
+
+/// The drag bar after moving it by `dir` bars, if the drag can go there:
+/// not before the head's bar and not a whole phrase past it.
+fn drag_bar_step(d: Drag, dir: i32, n: usize) -> Option<i64> {
+    let bar = d.bar + dir.signum() as i64;
+    let head_bar = (d.head / STEPS) as i64;
+    (bar >= head_bar && bar - head_bar < (n / STEPS) as i64).then_some(bar)
+}
+
+/// Length of the dragged note when the finger is on column `k` of the drag
+/// bar: from the head to that step; one step when the finger is left of the
+/// head; never longer than the phrase or than up to the next note on the
+/// track.
+fn drag_len(d: Drag, k: usize, n: usize, on: impl Fn(usize) -> bool) -> u16 {
+    let idx = d.bar * STEPS as i64 + k as i64;
+    let len = (idx - d.head as i64 + 1).clamp(1, n as i64) as usize;
+    let next = (1..n).find(|j| on((d.head + j) % n)).unwrap_or(n);
+    len.min(next).max(1) as u16
 }
 
 pub fn note_name(n: u8) -> String {
@@ -569,6 +836,12 @@ pub struct SeqStats {
 
 #[derive(Clone, Copy)]
 struct Pending {
+    /// Beat and 16th of the note-off, on the grid of `epoch`; `t_off` is
+    /// recomputed from the current grid while the epoch matches, so a long
+    /// note follows tempo corrections.
+    n: i64,
+    sub: i64,
+    epoch: u32,
     t_off: f64,
     channel: u8,
     note: u8,
@@ -586,7 +859,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
     stats: &SeqStats,
 ) {
     let poll = 0.0015;
-    let mut pending: Vec<Pending> = Vec::with_capacity(TRACKS * 4 + 1);
+    let mut pending: Vec<Pending> = Vec::with_capacity(TRACKS * 8 + 1);
     let mut last_q: Option<i64> = None;
     let mut epoch = u32::MAX;
     let all_off = |pending: &mut Vec<Pending>| {
@@ -604,6 +877,13 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         let g = get_grid();
         let snap = get_snapshot();
         let tnow = now();
+        if g.running {
+            for p in &mut pending {
+                if p.epoch == g.epoch {
+                    p.t_off = g.tick_time(p.n, (p.sub * 6) as u32) - lead_s;
+                }
+            }
+        }
         // Note-offs are due regardless of the clock state.
         let next_off = pending.iter().map(|p| p.t_off).fold(f64::INFINITY, f64::min);
         if !g.running || !snap.playing {
@@ -662,6 +942,12 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         });
         if t_on <= t + 0.0002 {
             let (bar, k) = bar_and_step(&g, n, sub);
+            // Note-off `len` steps on: beat, 16th and time on this grid.
+            let off = |len: u16| {
+                let q_off = q + len.max(1) as i64;
+                let (n_off, sub_off) = (g.n0 + q_off.div_euclid(4), q_off.rem_euclid(4));
+                (n_off, sub_off, g.tick_time(n_off, (sub_off * 6) as u32) - lead_s)
+            };
             let pidx = bar.rem_euclid(snap.pattern.bars.max(1) as i64) as usize * STEPS + k;
             for tr in &snap.pattern.tracks {
                 if tr.muted {
@@ -671,7 +957,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                 if !st.on {
                     continue;
                 }
-                // Kill the same note if it is still sounding (tight gates on repeats).
+                // Kill the same note if it is still sounding (a repeat inside a long note).
                 if let Some(i) = pending.iter().position(|p| p.channel == tr.channel && p.note == st.note) {
                     let p = pending.swap_remove(i);
                     let _ = midi.note_off(p.channel, p.note);
@@ -681,9 +967,9 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                 } else {
                     stats.notes.fetch_add(1, Ordering::Relaxed);
                 }
-                let gate = step_len * tr.gate as f64 / 100.0;
+                let (n_off, sub_off, t_off) = off(st.len);
                 if pending.len() < pending.capacity() {
-                    pending.push(Pending { t_off: t_on + gate.max(0.005), channel: tr.channel, note: st.note, bass: false });
+                    pending.push(Pending { n: n_off, sub: sub_off, epoch: g.epoch, t_off, channel: tr.channel, note: st.note, bass: false });
                 } else {
                     let _ = midi.note_off(tr.channel, st.note);
                 }
@@ -705,9 +991,9 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                 } else {
                     stats.notes.fetch_add(1, Ordering::Relaxed);
                 }
-                let gate = step_len * b.gate as f64 / 100.0;
+                let (n_off, sub_off, t_off) = off(st.len);
                 if pending.len() < pending.capacity() {
-                    pending.push(Pending { t_off: t_on + gate.max(0.005), channel: b.channel, note: st.note, bass: true });
+                    pending.push(Pending { n: n_off, sub: sub_off, epoch: g.epoch, t_off, channel: b.channel, note: st.note, bass: true });
                 } else {
                     let _ = midi.note_off(b.channel, st.note);
                 }
@@ -726,7 +1012,7 @@ mod tests {
         let mut s = SeqState::default();
         assert!(s.apply(SeqAction::ToggleStep(1, 4)));
         let st = s.pattern().tracks[1].steps[4];
-        assert!(st.on && st.note == 38 && st.vel == 100);
+        assert!(st.on && st.note == 38 && st.vel == 100 && st.len == 1);
         assert_eq!(s.track, 1);
         // edit mode: select the step and change its note only
         s.apply(SeqAction::ToggleEdit);
@@ -803,10 +1089,108 @@ mod tests {
         let mut s = SeqState::default();
         s.apply(SeqAction::Adjust(Param::Channel, -20));
         assert_eq!(s.pattern().tracks[0].channel, 0);
-        s.apply(SeqAction::Adjust(Param::Gate, 500));
-        assert_eq!(s.pattern().tracks[0].gate, 100);
         s.apply(SeqAction::Adjust(Param::Velocity, -500));
         assert_eq!(s.pattern().tracks[0].vel, 1);
+    }
+
+    #[test]
+    fn drag_sets_note_length() {
+        use SeqAction::*;
+        let mut s = SeqState::default();
+        s.apply(Bars(2));
+        s.apply(Bar(0));
+        let len = |s: &SeqState, i: usize| s.pattern().tracks[3].steps[i].len;
+        let cov = |s: &SeqState| {
+            let tr = &s.pattern().tracks[3];
+            cover_map(|i| tr.steps[i].on.then_some(tr.steps[i].len as usize), 32)
+        };
+        // down on an empty cell makes a one-step note at once
+        assert!(s.apply(CellDown(3, 4)));
+        assert_eq!(len(&s, 4), 1);
+        // dragging right lengthens it, dragging left of the head leaves one step
+        assert!(s.apply(CellDrag(9)));
+        assert_eq!(len(&s, 4), 6);
+        assert!(!s.apply(CellDrag(9)), "same column again changes nothing");
+        assert!(s.apply(CellDrag(2)));
+        assert_eq!(len(&s, 4), 1);
+        assert!(s.apply(CellDrag(15)));
+        assert!(!s.apply(CellUp), "lifting after a drag does not clear");
+        assert_eq!(len(&s, 4), 12);
+        assert_eq!(cov(&s)[4], Some(4));
+        assert_eq!(cov(&s)[15], Some(4));
+        assert_eq!(cov(&s)[16], None);
+        // a tap on the head clears the note
+        assert!(!s.apply(CellDown(3, 4)));
+        assert!(s.apply(CellUp));
+        assert!(!s.pattern().tracks[3].steps[4].on);
+        // across the bar: from step 14, hold at the right edge -> bar 2 shows,
+        // locked, the note fills it; drag back to its step 1
+        s.apply(CellDown(3, 14));
+        s.apply(CellDrag(15));
+        assert!(s.apply(CellDragBar(1)));
+        assert_eq!((s.shown_bar(), s.bar_lock), (1, true));
+        assert_eq!(len(&s, 14), 18);
+        assert!(s.apply(CellDrag(1)));
+        assert!(!s.apply(CellUp));
+        assert_eq!(len(&s, 14), 4);
+        assert!(!s.apply(CellDragBar(1)), "a note cannot be longer than the phrase");
+        // in bar 2 the continuation can be dragged on
+        assert!(!s.apply(CellDown(3, 0)), "the tail belongs to the note in bar 1: nothing changes yet");
+        assert!(s.apply(CellDrag(3)));
+        assert!(!s.apply(CellUp));
+        assert_eq!(len(&s, 14), 6);
+        assert_eq!(cov(&s)[16 + 3], Some(14));
+        assert_eq!(cov(&s)[16 + 4], None);
+        // back over the edge to the left: the note ends on step 1 of bar 1 ... no,
+        // the drag cannot go before the head's bar; from bar 2 it can
+        s.apply(CellDown(3, 3));
+        assert!(s.apply(CellDragBar(-1)));
+        assert_eq!((s.shown_bar(), len(&s, 14)), (0, 1));
+        assert!(!s.apply(CellDragBar(-1)));
+        s.apply(CellDrag(15));
+        s.apply(CellUp);
+        assert_eq!(len(&s, 14), 2);
+        s.apply(CellDown(3, 14));
+        s.apply(CellDragBar(1));
+        s.apply(CellDrag(3));
+        s.apply(CellUp);
+        assert_eq!(len(&s, 14), 6);
+        assert!(s.apply(Bar(1)));
+        // a tap inside a note cuts it and starts a new one; a later note caps a drag
+        assert!(s.apply(ToggleStep(3, 1)));
+        assert_eq!(len(&s, 14), 3);
+        assert_eq!(len(&s, 17), 1);
+        s.apply(ToggleStep(3, 8));
+        s.apply(CellDown(3, 1));
+        s.apply(CellDrag(12));
+        s.apply(CellUp);
+        assert_eq!(len(&s, 17), 7, "stops before the note on step 8");
+        // the phrase wraps: a note at the end of the last bar dragged over the
+        // edge runs into bar 1, up to the next note there (step 14)
+        s.apply(ToggleStep(3, 15));
+        s.apply(CellDown(3, 15));
+        assert!(s.apply(CellDragBar(1)));
+        assert_eq!(s.shown_bar(), 0);
+        assert_eq!(len(&s, 31), 15);
+        assert!(s.apply(CellDrag(2)));
+        s.apply(CellUp);
+        assert_eq!(len(&s, 31), 4);
+        assert_eq!(cov(&s)[2], Some(31));
+        assert_eq!(cov(&s)[3], None);
+        // and its wrapped tail in bar 1 can be dragged too
+        assert!(!s.apply(CellDown(3, 1)));
+        assert!(s.apply(CellDrag(5)));
+        s.apply(CellUp);
+        assert_eq!(len(&s, 31), 7);
+        // a file from before lengths (with gates) still loads; lengths are 1
+        let old = "current = 0\n[[patterns]]\n[[patterns.tracks]]\nchannel = 9\nnote = 36\nvel = 100\ngate = 50\nmuted = false\n[[patterns.tracks.steps]]\non = true\nnote = 36\nvel = 100\n";
+        let dir = std::env::temp_dir().join(format!("len-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patterns.toml");
+        std::fs::write(&path, old).unwrap();
+        let l = SeqState::load(&path).unwrap();
+        assert!(l.pattern().tracks[0].steps[0].on && l.pattern().tracks[0].steps[0].len == 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -845,8 +1229,10 @@ mod tests {
         st.apply(SeqAction::ToggleStep(0, 0));
         st.apply(SeqAction::ToggleStep(0, 8));
         st.apply(SeqAction::ToggleStep(1, 4));
-        st.apply(SeqAction::SelectTrack(1));
-        st.apply(SeqAction::Adjust(Param::Gate, -40)); // 10 %
+        // the kick on step 8 rings for 3 steps
+        st.apply(SeqAction::CellDown(0, 8));
+        st.apply(SeqAction::CellDrag(10));
+        st.apply(SeqAction::CellUp);
         let snap = std::sync::Arc::new(st.snapshot());
         let t0 = now() + 0.05;
         let grid = Grid { running: true, epoch: 1, t0, n0: 0, period: 0.25, ..Grid::default() };
@@ -870,11 +1256,13 @@ mod tests {
             assert!((e.0 - want).abs() < 0.003, "step {step}: {} vs {want}", e.0);
             assert_eq!(e.3, note);
         }
-        // every note-on got its note-off, the short gate first
+        // every note-on got its note-off: one step later, three for the long kick
         let offs: Vec<_> = ev.iter().filter(|e| !e.1).collect();
         assert_eq!(offs.len(), 4);
         let snare_off = offs.iter().find(|e| e.3 == 38).unwrap();
-        assert!((snare_off.0 - (t0 + 4.0 * 0.0625 + 0.00625)).abs() < 0.004, "gate: {}", snare_off.0 - t0);
+        assert!((snare_off.0 - (t0 + 5.0 * 0.0625)).abs() < 0.004, "len: {}", snare_off.0 - t0);
+        let kick_offs: Vec<f64> = offs.iter().filter(|e| e.3 == 36).map(|e| e.0 - t0).collect();
+        assert!(kick_offs.iter().any(|&t| (t - 11.0 * 0.0625).abs() < 0.004), "long kick off: {kick_offs:?}");
     }
 
     #[test]
@@ -900,8 +1288,20 @@ mod tests {
         assert!(s.apply(SeqAction::BassScroll(127)));
         assert_eq!(s.bass.base, BASS_TOP);
         assert!(s.apply(SeqAction::BassScroll(36 - BASS_TOP as i32)));
-        s.apply(SeqAction::BassAdjust(BassParam::Gate, 40));
-        assert_eq!(s.bass.gate, 400);
+        // a tap on another row moves the note and keeps its length (bar 2 is shown)
+        s.apply(SeqAction::BassCellDown(3, 4));
+        s.apply(SeqAction::BassCellDrag(6));
+        s.apply(SeqAction::BassCellUp);
+        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 39, len: 3 });
+        assert!(s.apply(SeqAction::BassSet(5, 4)));
+        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 41, len: 3 });
+        // a tap inside it, in its own row, cuts it and starts a new note there
+        assert!(s.apply(SeqAction::BassSet(5, 6)));
+        assert_eq!(s.bass.steps[20].len, 2);
+        assert_eq!(s.bass.steps[22], BassStep { on: true, note: 41, len: 1 });
+        // a tap on the head in its own row clears it
+        assert!(s.apply(SeqAction::BassSet(5, 4)));
+        assert!(!s.bass.steps[20].on);
         assert!(s.apply(SeqAction::BassBars(1)));
         assert_eq!(s.bass_bar, 0);
         assert!(!s.apply(SeqAction::BassBars(3)));
@@ -934,9 +1334,14 @@ mod tests {
         // 240 BPM, 2 bars. Bar 0: C1 on step 0 ringing 4 steps, E1 on step 2
         // (cuts the C), bar 1: D1 on step 0. Bar 2 wraps back to bar 0.
         let mut st = SeqState::default();
-        st.apply(SeqAction::BassAdjust(BassParam::Gate, 32)); // 400 %
-        st.apply(SeqAction::BassSet(0, 0));
-        st.apply(SeqAction::BassSet(4, 2));
+        st.apply(SeqAction::BassCellDown(0, 0));
+        st.apply(SeqAction::BassCellDrag(3)); // C1, 4 steps
+        st.apply(SeqAction::BassCellUp);
+        st.apply(SeqAction::BassCellDown(4, 2)); // E1 inside the C: cuts it to 2 steps
+        st.apply(SeqAction::BassCellDrag(5)); // 4 steps
+        st.apply(SeqAction::BassCellUp);
+        assert_eq!(st.bass.steps[0].len, 2);
+        assert_eq!(st.bass.steps[2].len, 4);
         st.apply(SeqAction::BassBar(1));
         st.apply(SeqAction::BassSet(2, 0));
         let snap = std::sync::Arc::new(st.snapshot());
@@ -962,12 +1367,12 @@ mod tests {
             assert_eq!(e.3, note);
             assert_eq!(e.2, 0);
         }
-        // the C was cut by the E after 2 steps, the E rang its full 4 steps
+        // the C ends where the E starts, the E rings its 4 steps
         let offs: Vec<_> = ev.iter().filter(|e| !e.1).collect();
         let c_off = offs.iter().find(|e| e.3 == 36).unwrap();
         assert!((c_off.0 - (t0 + 2.0 * 0.0625)).abs() < 0.004, "cut: {}", c_off.0 - t0);
         let e_off = offs.iter().find(|e| e.3 == 40).unwrap();
-        assert!((e_off.0 - (t0 + 6.0 * 0.0625)).abs() < 0.004, "gate: {}", e_off.0 - t0);
+        assert!((e_off.0 - (t0 + 6.0 * 0.0625)).abs() < 0.004, "len: {}", e_off.0 - t0);
     }
 
     #[test]

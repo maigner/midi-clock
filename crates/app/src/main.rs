@@ -103,6 +103,9 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     for k in (0..16).step_by(2) {
         seq.apply(sequencer::SeqAction::ToggleStep(2, k));
     }
+    seq.apply(sequencer::SeqAction::CellDown(3, 4)); // an open hat ringing 4 steps
+    seq.apply(sequencer::SeqAction::CellDrag(7));
+    seq.apply(sequencer::SeqAction::CellUp);
     seq.apply(sequencer::SeqAction::SelectTrack(0));
     seq.apply(sequencer::SeqAction::Bar(0)); // locked to bar 1
     let st3 = ui::Status { seq: Arc::new(seq.clone()), ..st.clone() };
@@ -113,6 +116,16 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     for (row, k) in [(0, 0), (0, 3), (7, 6), (10, 8), (0, 10), (3, 12), (5, 14)] {
         seq.apply(BassSet(row, k));
     }
+    use sequencer::SeqAction::{BassBar, BassCellDown, BassCellDrag, BassCellDragBar, BassCellUp};
+    seq.apply(BassCellDown(7, 6)); // two steps
+    seq.apply(BassCellDrag(7));
+    seq.apply(BassCellUp);
+    seq.apply(BassCellDown(5, 14)); // across the bar into step 4 of bar 2
+    seq.apply(BassCellDrag(15));
+    seq.apply(BassCellDragBar(1));
+    seq.apply(BassCellDrag(3));
+    seq.apply(BassCellUp);
+    seq.apply(BassBar(0));
     let st4 = ui::Status { seq: Arc::new(seq), ..st };
     std::fs::write(&bassp, ui::snapshot(w, h, &st4, Page::Bass, None))?;
     eprintln!("wrote {}, {}, {} and {}", path.display(), manual.display(), seqp.display(), bassp.display());

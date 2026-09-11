@@ -7,10 +7,10 @@ use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Arc, Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle};
+use embedded_graphics::primitives::{Arc, Circle, CornerRadii, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
-use sequencer::{note_name, BassParam, Param, SeqState, BASS_ROWS, BASS_TOP, STEPS, TRACKS};
+use sequencer::{cover_map, note_name, phrase_steps, BassParam, Param, SeqState, BASS_ROWS, BASS_TOP, STEPS, TRACKS};
 use tracker::{Grid, State};
 
 use crate::canvas::{Canvas, Scaled};
@@ -163,11 +163,44 @@ const TRACK_COLORS: [Rgb888; TRACKS] = [
     Rgb888::new(240, 120, 180),
     Rgb888::new(120, 200, 200),
 ];
+/// The -/+ parameter groups along the bottom of the sequence and bass pages.
+const SEQ_PARAMS: [Param; 3] = [Param::Channel, Param::Note, Param::Velocity];
+const BASS_PARAMS: [BassParam; 2] = [BassParam::Channel, BassParam::Velocity];
+
+/// Width of one of `n` parameter groups across `w`, `m` apart and from the edges.
+fn param_group_w(w: i32, m: i32, n: usize) -> i32 {
+    (w - (n as i32 + 1) * m) / n as i32
+}
+
+/// A darker shade of a colour: the steps a note rings on after its head.
+fn dim(c: Rgb888) -> Rgb888 {
+    let d = |v: u8| (v as u16 * 3 / 5) as u8;
+    Rgb888::new(d(c.r()), d(c.g()), d(c.b()))
+}
+
+/// A grid cell of a note, joined across the gap to the neighbour cell on
+/// the sides where the note goes on; a joined side has no rounding, so a
+/// flat edge at the border of the grid shows the note continues in the
+/// next (previous) bar.
+fn note_cell(cell: Rectangle, gap: i32, corner: Size, join_l: bool, join_r: bool) -> RoundedRectangle {
+    let (x, w) = (cell.top_left.x, cell.size.width as i32);
+    let x0 = if join_l { x - gap } else { x };
+    let x1 = if join_r { x + w + gap } else { x + w };
+    let r = Rectangle::new(Point::new(x0, cell.top_left.y), Size::new((x1 - x0).max(1) as u32, cell.size.height));
+    let side = |joined: bool| if joined { Size::zero() } else { corner };
+    RoundedRectangle::new(r, CornerRadii { top_left: side(join_l), bottom_left: side(join_l), top_right: side(join_r), bottom_right: side(join_r) })
+}
 
 /// Sequence page content, extracted from the state so views compare cheaply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeqView {
+    /// A note starts on this step.
     on: [[bool; STEPS]; TRACKS],
+    /// The note sounding on each step: the absolute step of its head, for
+    /// the head itself and the steps its length covers.
+    cover: [[Option<u16>; STEPS]; TRACKS],
+    /// The note on the last step goes on into the next bar.
+    cont_right: [bool; TRACKS],
     /// Step note differs from the track's default note.
     alt: [[bool; STEPS]; TRACKS],
     labels: [String; TRACKS],
@@ -185,7 +218,7 @@ pub struct SeqView {
     edit: bool,
     playing: bool,
     pattern: usize,
-    params: [String; 4],
+    params: [String; 3],
 }
 
 impl SeqView {
@@ -200,16 +233,25 @@ impl SeqView {
         let bars = p.bars.max(1);
         let play = sequencer::phrase_playhead(&s.live, s.now, bars as usize);
         let bar = shown_bar(st.shown_bar(), st.bar_lock, play);
+        let n = phrase_steps(bars);
+        let next_bar = (bar + 1) % bars as usize;
         let mut on = [[false; STEPS]; TRACKS];
+        let mut cover = [[None; STEPS]; TRACKS];
+        let mut cont_right = [false; TRACKS];
         let mut alt = [[false; STEPS]; TRACKS];
         let mut labels: [String; TRACKS] = Default::default();
         let mut muted = [false; TRACKS];
         for (t, tr) in p.tracks.iter().enumerate().take(TRACKS) {
+            let map = cover_map(|i| tr.steps.get(i).filter(|st| st.on).map(|st| st.len as usize), n);
             for k in 0..STEPS {
-                let step = tr.steps.get(bar * STEPS + k).copied().unwrap_or_default();
-                on[t][k] = step.on;
-                alt[t][k] = step.on && step.note != tr.note;
+                let idx = bar * STEPS + k;
+                cover[t][k] = map[idx];
+                on[t][k] = map[idx] == Some(idx as u16);
+                let step = tr.steps.get(idx).copied().unwrap_or_default();
+                alt[t][k] = on[t][k] && step.note != tr.note;
             }
+            let last = bar * STEPS + STEPS - 1;
+            cont_right[t] = map[last].is_some() && map[next_bar * STEPS] == map[last];
             labels[t] = note_name(tr.note);
             muted[t] = tr.muted;
         }
@@ -221,6 +263,8 @@ impl SeqView {
         };
         SeqView {
             on,
+            cover,
+            cont_right,
             alt,
             labels,
             muted,
@@ -233,15 +277,20 @@ impl SeqView {
             edit: st.edit,
             playing: st.playing,
             pattern: st.current,
-            params: [format!("CH {}", tr.channel + 1), note, vel, format!("GATE {}%", tr.gate)],
+            params: [format!("CH {}", tr.channel + 1), note, vel],
         }
     }
 }
 
-/// Bass page content: the bar being shown, one note per step at most.
+/// Bass page content: the bar being shown, one note sounding per step at most.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BassView {
+    /// The note sounding on each step (its head may be on an earlier step).
     notes: [Option<u8>; STEPS],
+    /// Absolute step of the head of the note sounding on each step.
+    cover: [Option<u16>; STEPS],
+    /// The note on the last step goes on into the next bar.
+    cont_right: bool,
     /// Lowest note of the shown pitch window.
     base: u8,
     labels: [String; BASS_ROWS],
@@ -251,7 +300,7 @@ pub struct BassView {
     locked: bool,
     /// Bar and step the clock is on within the phrase.
     play: Option<(usize, usize)>,
-    params: [String; 3],
+    params: [String; 2],
 }
 
 impl BassView {
@@ -260,24 +309,31 @@ impl BassView {
         let bars = b.bars.max(1);
         let play = sequencer::phrase_playhead(&s.live, s.now, bars as usize);
         let bar = shown_bar(s.seq.bass_bar.min(bars as usize - 1), s.seq.bass_bar_lock, play);
+        let n = phrase_steps(bars);
+        let map = cover_map(|i| b.steps.get(i).filter(|st| st.on).map(|st| st.len as usize), n);
         let mut notes = [None; STEPS];
-        for (k, n) in notes.iter_mut().enumerate() {
-            let st = b.steps.get(bar * STEPS + k).copied().unwrap_or_default();
-            *n = st.on.then_some(st.note);
+        let mut cover = [None; STEPS];
+        for k in 0..STEPS {
+            cover[k] = map[bar * STEPS + k];
+            notes[k] = cover[k].and_then(|h| b.steps.get(h as usize)).map(|st| st.note);
         }
+        let last = bar * STEPS + STEPS - 1;
+        let cont_right = map[last].is_some() && map[((bar + 1) % bars as usize) * STEPS] == map[last];
         let mut labels: [String; BASS_ROWS] = Default::default();
         for (r, l) in labels.iter_mut().enumerate() {
             *l = note_name(b.base + r as u8);
         }
         BassView {
             notes,
+            cover,
+            cont_right,
             base: b.base,
             labels,
             bars,
             bar,
             locked: s.seq.bass_bar_lock,
             play,
-            params: [format!("CH {}", b.channel + 1), format!("VEL {}", b.vel), format!("GATE {}%", b.gate)],
+            params: [format!("CH {}", b.channel + 1), format!("VEL {}", b.vel)],
         }
     }
 }
@@ -505,7 +561,7 @@ impl Screen {
         // Parameters along the bottom of both pages.
         let yp = (h as f64 * 0.86) as i32;
         let hp = h - m - yp;
-        let group_w = (w - 5 * m) / 4;
+        let group_w = param_group_w(w, m, SEQ_PARAMS.len());
         let pm_w = group_w / 4;
         // --- sequence page ---------------------------------------------------------
         let gy0 = by + bh + m;
@@ -520,7 +576,7 @@ impl Screen {
         let gx0 = 2 * m + track_w;
         let cell_w = (w - m - gx0 - gap * (STEPS as i32 - 1)) / STEPS as i32;
         let grid = rect(gx0, gy0, cell_w * STEPS as i32 + gap * (STEPS as i32 - 1), cell_h * TRACKS as i32 + gap * (TRACKS as i32 - 1));
-        for (i, p) in [Param::Channel, Param::Note, Param::Velocity, Param::Gate].into_iter().enumerate() {
+        for (i, p) in SEQ_PARAMS.into_iter().enumerate() {
             let gx = m + i as i32 * (group_w + m);
             buttons.push((Button::ParamMinus(p), rect(gx, yp, pm_w, hp)));
             buttons.push((Button::ParamPlus(p), rect(gx + group_w - pm_w, yp, pm_w, hp)));
@@ -544,9 +600,9 @@ impl Screen {
         let px0 = m + scroll_w + gap + label_w + m;
         let bass_cell_w = (w - m - px0 - gap * (STEPS as i32 - 1)) / STEPS as i32;
         let bass_grid = rect(px0, py0, bass_cell_w * STEPS as i32 + gap * (STEPS as i32 - 1), grid_h);
-        let group_w3 = (w - 4 * m) / 3;
+        let group_w3 = param_group_w(w, m, BASS_PARAMS.len());
         let pm_w3 = group_w3 / 4;
-        for (i, p) in [BassParam::Channel, BassParam::Velocity, BassParam::Gate].into_iter().enumerate() {
+        for (i, p) in BASS_PARAMS.into_iter().enumerate() {
             let gx = m + i as i32 * (group_w3 + m);
             buttons.push((Button::BassMinus(p), rect(gx, yp, pm_w3, hp)));
             buttons.push((Button::BassPlus(p), rect(gx + group_w3 - pm_w3, yp, pm_w3, hp)));
@@ -577,6 +633,29 @@ impl Screen {
     /// Vertical distance between two bass rows: one semitone of drag scrolling.
     pub fn bass_row_pitch(&self) -> i32 {
         self.bass_cell_h + (self.m / 2).max(2)
+    }
+
+    /// Column of the sequence (or bass) grid under `x`, clamped to the grid,
+    /// for a finger dragging a note's length.
+    pub fn column_at(&self, x: i32, bass: bool) -> usize {
+        let (g, cw) = if bass { (self.bass_grid, self.bass_cell_w) } else { (self.grid, self.cell_w) };
+        let gap = (self.m / 2).max(2);
+        ((x - g.top_left.x) / (cw + gap)).clamp(0, STEPS as i32 - 1) as usize
+    }
+
+    /// +1 when `x` is at the right edge of the grid (the outer quarter of the
+    /// last column, or beyond), -1 at the left edge, 0 elsewhere.
+    pub fn grid_edge(&self, x: i32, bass: bool) -> i32 {
+        let (g, cw) = if bass { (self.bass_grid, self.bass_cell_w) } else { (self.grid, self.cell_w) };
+        let l = g.top_left.x;
+        let r = l + g.size.width as i32;
+        if x >= r - cw / 4 {
+            1
+        } else if x < l + cw / 4 {
+            -1
+        } else {
+            0
+        }
     }
 
     pub fn hit(&self, x: i32, y: i32, page: Page) -> Option<Hit> {
@@ -889,15 +968,20 @@ impl Screen {
             for k in 0..STEPS {
                 let x = gx + k as i32 * (self.cell_w + gap);
                 let y = gy + t as i32 * (self.cell_h + gap);
-                let r = Rectangle::new(Point::new(x, y), Size::new(self.cell_w as u32, self.cell_h as u32));
                 let on_playhead = playhead == Some(k);
-                let fill = if q.on[t][k] {
+                let cov = q.cover[t][k];
+                let head = q.on[t][k];
+                let join_l = cov.is_some() && if k == 0 { !head } else { q.cover[t][k - 1] == cov };
+                let join_r = cov.is_some() && if k == STEPS - 1 { q.cont_right[t] } else { q.cover[t][k + 1] == cov };
+                let fill = if cov.is_some() {
                     if q.muted[t] {
                         DIM
                     } else if on_playhead {
                         TEXT
-                    } else {
+                    } else if head {
                         TRACK_COLORS[t]
+                    } else {
+                        dim(TRACK_COLORS[t])
                     }
                 } else if on_playhead {
                     PANEL_PRESSED
@@ -906,7 +990,7 @@ impl Screen {
                 } else {
                     PANEL
                 };
-                let rr = RoundedRectangle::with_equal_corners(r, corner);
+                let rr = note_cell(Rectangle::new(Point::new(x, y), Size::new(self.cell_w as u32, self.cell_h as u32)), gap, corner, join_l, join_r);
                 let selected = q.track == t && q.selected_step == Some(k);
                 let style = if selected {
                     PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(YELLOW).stroke_width(3).build()
@@ -926,7 +1010,7 @@ impl Screen {
         // --- parameter labels between their -/+ buttons ---------------------
         let yp = (self.h as f64 * 0.86) as i32;
         let hp = self.h - m - yp;
-        let group_w = (self.w - 5 * m) / 4;
+        let group_w = param_group_w(self.w, m, SEQ_PARAMS.len());
         for (i, label) in q.params.iter().enumerate() {
             let gx = m + i as i32 * (group_w + m);
             let r = Rectangle::new(Point::new(gx + group_w / 4 + gap, yp), Size::new((group_w / 2 - 2 * gap) as u32, hp as u32));
@@ -969,12 +1053,18 @@ impl Screen {
                 let x = gx + k as i32 * (cw + gap);
                 let note = q.base + r as u8;
                 let on = q.notes[k] == Some(note);
+                let cov = q.cover[k].filter(|_| on);
+                let head = cov == Some((q.bar * STEPS + k) as u16);
+                let join_l = cov.is_some() && if k == 0 { !head } else { q.cover[k - 1] == cov };
+                let join_r = cov.is_some() && if k == STEPS - 1 { q.cont_right } else { q.cover[k + 1] == cov };
                 let on_playhead = playhead == Some(k);
                 let fill = if on {
                     if on_playhead {
                         TEXT
-                    } else {
+                    } else if head {
                         BASS
+                    } else {
+                        dim(BASS)
                     }
                 } else if on_playhead {
                     PANEL_PRESSED
@@ -985,7 +1075,7 @@ impl Screen {
                 } else {
                     PANEL
                 };
-                let rr = RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(x, y), Size::new(cw as u32, ch as u32)), corner);
+                let rr = note_cell(Rectangle::new(Point::new(x, y), Size::new(cw as u32, ch as u32)), gap, corner, join_l, join_r);
                 let _ = rr.into_styled(PrimitiveStyle::with_fill(fill)).draw(c);
                 // a note outside the shown octave: a bar at the top or bottom edge
                 if let Some(n) = q.notes[k] {
@@ -1001,7 +1091,7 @@ impl Screen {
         // --- parameter labels between their -/+ buttons ---------------------
         let yp = (self.h as f64 * 0.86) as i32;
         let hp = self.h - m - yp;
-        let group_w = (self.w - 4 * m) / 3;
+        let group_w = param_group_w(self.w, m, BASS_PARAMS.len());
         for (i, label) in q.params.iter().enumerate() {
             let gx = m + i as i32 * (group_w + m);
             let r = Rectangle::new(Point::new(gx + group_w / 4 + gap, yp), Size::new((group_w / 2 - 2 * gap) as u32, hp as u32));
@@ -1019,6 +1109,9 @@ mod tests {
         let mut seq = SeqState::default();
         seq.apply(sequencer::SeqAction::ToggleStep(0, 0));
         seq.apply(sequencer::SeqAction::ToggleStep(1, 4));
+        seq.apply(sequencer::SeqAction::CellDown(2, 6)); // open hat ringing 4 steps
+        seq.apply(sequencer::SeqAction::CellDrag(9));
+        seq.apply(sequencer::SeqAction::CellUp);
         seq.apply(sequencer::SeqAction::BassSet(0, 0));
         seq.apply(sequencer::SeqAction::BassSet(7, 8));
         seq.apply(sequencer::SeqAction::BassScroll(-2)); // window A#0..A1, C1 still on step 0
@@ -1125,6 +1218,80 @@ mod tests {
         let mut s5 = s.clone();
         s5.live.running = false;
         assert_eq!(View::build_with_touch(&s5, Page::Bass, None, None).bass_bars(), Some((0, None)));
+    }
+
+    #[test]
+    fn long_notes_show_joined_and_continue_over_the_bar() {
+        let s = status();
+        let v = View::build_with_touch(&s, Page::Sequence, None, None);
+        let q = v.seq.as_ref().unwrap();
+        assert!(q.on[2][6] && !q.on[2][7]);
+        assert_eq!(q.cover[2][6..10], [Some(6); 4]);
+        assert_eq!(q.cover[2][10], None);
+        // a bass note from step 14 into bar 2 (the phrase is 2 bars)
+        let mut seq = (*s.seq).clone();
+        seq.apply(sequencer::SeqAction::BassBar(0));
+        seq.apply(sequencer::SeqAction::BassCellDown(0, 14));
+        seq.apply(sequencer::SeqAction::BassCellDrag(15));
+        seq.apply(sequencer::SeqAction::BassCellDragBar(1));
+        seq.apply(sequencer::SeqAction::BassCellDrag(2));
+        seq.apply(sequencer::SeqAction::BassCellUp);
+        assert_eq!(seq.bass_bar, 1);
+        let s2 = Status { seq: std::sync::Arc::new(seq.clone()), ..s.clone() };
+        let b = View::build_with_touch(&s2, Page::Bass, None, None).bass.unwrap();
+        assert_eq!(b.cover[0..3], [Some(14); 3]);
+        assert_eq!(b.notes[0], Some(34), "row 0 of the scrolled window");
+        assert!(!b.cont_right);
+        seq.apply(sequencer::SeqAction::BassBar(0));
+        let s3 = Status { seq: std::sync::Arc::new(seq), ..s };
+        let b = View::build_with_touch(&s3, Page::Bass, None, None).bass.unwrap();
+        assert_eq!(b.cover[14], Some(14));
+        assert!(b.cont_right);
+    }
+
+    #[test]
+    fn a_drag_on_the_grid_sets_a_length() {
+        use crate::{Action, Session, TouchEvent, UiConfig};
+        use sequencer::SeqAction::*;
+        let (w, h) = (800usize, 480usize);
+        let screen = Screen::new(w, h);
+        let mut ses = Session::new(&UiConfig::default(), Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, Rotation::R0));
+        ses.set_page(Page::Sequence);
+        let gap = (screen.m / 2).max(2);
+        let cell = |t: usize, k: usize| {
+            (screen.grid.top_left.x + k as i32 * (screen.cell_w + gap) + screen.cell_w / 2, screen.grid.top_left.y + t as i32 * (screen.cell_h + gap) + screen.cell_h / 2)
+        };
+        let mut got = Vec::new();
+        let mut act = |a: Action| got.push(a);
+        let (x, y) = cell(2, 3);
+        ses.touch(TouchEvent::Down { x, y, t: 1.0 }, Mode::Auto, &mut act);
+        let (x, y) = cell(2, 6);
+        ses.touch(TouchEvent::Move { x, y, t: 1.1 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Move { x: x + 1, y, t: 1.2 }, Mode::Auto, &mut act);
+        // to the right edge and hold: the next bar
+        let (x, y) = cell(3, 15);
+        let x = x + screen.cell_w / 2 - 1;
+        ses.touch(TouchEvent::Move { x, y, t: 1.3 }, Mode::Auto, &mut act);
+        ses.tick(1.5, &mut act);
+        ses.tick(2.0, &mut act);
+        ses.touch(TouchEvent::Up { t: 2.1 }, Mode::Auto, &mut act);
+        assert_eq!(got, vec![Action::Seq(CellDown(2, 3)), Action::Seq(CellDrag(6)), Action::Seq(CellDrag(15)), Action::Seq(CellDragBar(1)), Action::Seq(CellUp)]);
+        // the bass grid likewise
+        got.clear();
+        let mut act = |a: Action| got.push(a);
+        ses.set_page(Page::Bass);
+        let bcell = |r: usize, k: usize| {
+            (
+                screen.bass_grid.top_left.x + k as i32 * (screen.bass_cell_w + gap) + screen.bass_cell_w / 2,
+                screen.bass_grid.top_left.y + (BASS_ROWS - 1 - r) as i32 * (screen.bass_cell_h + gap) + screen.bass_cell_h / 2,
+            )
+        };
+        let (x, y) = bcell(4, 2);
+        ses.touch(TouchEvent::Down { x, y, t: 3.0 }, Mode::Auto, &mut act);
+        let (x, y) = bcell(4, 5);
+        ses.touch(TouchEvent::Move { x, y, t: 3.1 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Up { t: 3.2 }, Mode::Auto, &mut act);
+        assert_eq!(got, vec![Action::Seq(BassCellDown(4, 2)), Action::Seq(BassCellDrag(5)), Action::Seq(BassCellUp)]);
     }
 
     #[test]

@@ -135,7 +135,7 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   C1  ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □      8 tracks x 16 steps of the shown bar
   D1  □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □      playhead column highlighted
   ...
- [-] CH 10 [+]  [-] NOTE C1 [+]  [-] VEL 100 [+]  [-] GATE 50% [+]
+ [-] CH 10 [+]        [-] NOTE C1 [+]        [-] VEL 100 [+]
 ```
 
 - Steps are 16ths of the bar; step 1 is the downbeat of the live grid, so the
@@ -152,7 +152,19 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   button toggles between following the clock and holding the shown bar.
 - Tap a cell to set or clear a step with the track's note and velocity. Tap
   the note name on the left to select a track; `-`/`+` (hold to repeat)
-  change its MIDI channel, note, velocity and gate length.
+  change its MIDI channel, note and velocity.
+- **Longer notes**: put the finger down on the step and drag to the right;
+  the note lasts up to the step you let go on. Its steps are drawn joined,
+  the head in the track colour, the rest darker. Hold the finger at the
+  right edge of the grid for a moment and the next bar slides in (the
+  screen locks to it) with the note running into it; drag back to where it
+  should end, or hold at the edge again for one more bar. Holding at the
+  left edge goes back. A note may cross as many bars as the phrase has and
+  wrap around its end. A note that goes on into the next bar has a flat
+  right edge; in that bar it starts with a flat left edge, and dragging any
+  of its steps there sets its end again. Tapping inside a note starts a new
+  note on that step and cuts the old one; a drag stops short of the next
+  note on the track.
 - The sequencer state also has play/mute, per-step editing and four patterns
   (`A`-`D`), but the screen has no buttons for them yet; pattern A is used.
 - Default tracks are General MIDI drums on channel 10 (kick, snare, hats,
@@ -160,8 +172,9 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   the last edit and loaded at start.
 - Notes go out on the same rawmidi port as the clock, from their own
   SCHED_FIFO thread (`sequencer_priority`), scheduled from the grid with
-  `midi.lead_ms` (+ `sequencer.lead_ms`) lead. Note-offs follow after the
-  gate; a retriggered note is released first. Stop, or an unplugged screen,
+  `midi.lead_ms` (+ `sequencer.lead_ms`) lead. Note-offs sit on the grid at
+  the end of the note, so a long note follows tempo corrections; a
+  retriggered note is released first. Stop, or an unplugged screen,
   never leaves notes hanging.
 - No screen? The UI just logs "continuing without the screen". Headless
   `--mode manual` runs a fixed clock at `manual_bpm`. `--no-ui` disables it.
@@ -178,12 +191,14 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
  [▲] B1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   twelve semitones, 16 steps of the shown bar
      ...                                    lowest note at the bottom
  [▼] C1  ■ □ □ ■ □ □ □ □ □ □ ■ □ □ □ □ □
- [-] CH 1 [+]      [-] VEL 100 [+]      [-] GATE 80% [+]
+ [-] CH 1 [+]                        [-] VEL 100 [+]
 ```
 
 - A single voice: each step holds one note or nothing, and a new note always
   ends the one before it. Tap a cell to put that note on the step; tap it
-  again to clear the step; tapping another row moves the note.
+  again to clear the step; tapping another row moves the note. Drag to the
+  right for a longer note, exactly as on the SEQUENCE tab, bar edges
+  included; a long note rings until the next note at the latest.
 - **LEN**, **BAR** and the padlock work as on the SEQUENCE tab; the bass
   phrase has its own length and its own lock, so a 2-bar drum pattern can run
   under an 8-bar bass line.
@@ -191,8 +206,7 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   scroll the window one semitone at a time (hold to repeat), or drag the note
   names up and down. Notes stay where they are; a note outside the shown
   range is marked by a thin bar at the top or bottom edge of its step.
-  **GATE** goes to 400 % in 10 % steps, so a note can ring across steps until
-  the next one cuts it. **CH** and **VEL** are the MIDI channel and velocity.
+  **CH** and **VEL** are the MIDI channel and velocity.
 - The bass line is saved in `sequencer.file` with the drum patterns.
 
 ### Working on the UI without the Pi
