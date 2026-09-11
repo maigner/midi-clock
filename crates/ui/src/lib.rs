@@ -81,6 +81,10 @@ pub struct Session {
     /// Finger down on a bass cell, direction not yet known: sideways it
     /// becomes a note drag, up or down a scroll, lifted in place a tap.
     pending: Option<PendingCell>,
+    /// The live grid and the drum phrase length as of the last frame: a pad
+    /// tap is placed on the nearest 16th for recording.
+    grid: tracker::Grid,
+    drum_bars: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +128,8 @@ impl Session {
             drag_y: None,
             cell_drag: None,
             pending: None,
+            grid: tracker::Grid::default(),
+            drum_bars: 1,
         }
     }
 
@@ -158,8 +164,17 @@ impl Session {
                 self.last_repeat = t;
                 match self.screen.hit(lx, ly, self.page) {
                     Some(Hit::Button(Button::PageTempo)) => self.page = Page::Tempo,
-                    Some(Hit::Button(Button::PageSequence)) => self.page = Page::Sequence,
+                    Some(Hit::Button(Button::PageLead)) => self.page = Page::Lead,
                     Some(Hit::Button(Button::PageBass)) => self.page = Page::Bass,
+                    Some(Hit::Button(Button::PageDrums)) => self.page = Page::Drums,
+                    Some(Hit::Button(Button::PageSettings)) => self.page = Page::Settings,
+                    // A pad tap carries where the clock is, so REC can put
+                    // the hit on the nearest 16th.
+                    Some(Hit::Button(Button::DrumPad(i))) => {
+                        self.pressed = Some(Button::DrumPad(i));
+                        let pos = sequencer::phrase_nearest(&self.grid, t - self.tap_offset_s, self.drum_bars as usize);
+                        act(Action::Seq(SeqAction::DrumPad(i, pos)));
+                    }
                     Some(Hit::Button(b)) => {
                         self.pressed = Some(b);
                         if b.enabled(mode) {
@@ -274,6 +289,8 @@ impl Session {
     /// screen so that edits land in it.
     pub fn frame(&mut self, now: f64, status: &Status, act: &mut impl FnMut(Action)) -> bool {
         self.next_frame = now + self.frame;
+        self.grid = status.live;
+        self.drum_bars = status.seq.drums.bars;
         let view = View::build_with_touch(status, self.page, self.pressed, self.finger);
         if let Some((bar, _)) = view.seq_bars() {
             if !status.seq.bar_lock && bar != status.seq.shown_bar() {
@@ -283,6 +300,11 @@ impl Session {
         if let Some((bar, _)) = view.bass_bars() {
             if !status.seq.bass_bar_lock && bar != status.seq.bass_bar {
                 act(Action::Seq(SeqAction::BassFollowBar(bar)));
+            }
+        }
+        if let Some((bar, _)) = view.drum_bars() {
+            if !status.seq.drum_bar_lock && bar != status.seq.drum_bar {
+                act(Action::Seq(SeqAction::DrumFollowBar(bar)));
             }
         }
         if self.last_view.as_ref() == Some(&view) {
@@ -373,7 +395,7 @@ pub fn run(
 
 fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
     let a = match b {
-        Button::PageTempo | Button::PageSequence | Button::PageBass => return,
+        Button::PageTempo | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => return,
         Button::ModeAuto => Action::SetMode(Mode::Auto),
         Button::ModeManual => Action::SetMode(Mode::Manual),
         Button::Minus5 => Action::Nudge(-5.0),
@@ -394,6 +416,16 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::BassMinus(p) => Action::Seq(SeqAction::BassAdjust(p, -1)),
         Button::BassPlus(p) => Action::Seq(SeqAction::BassAdjust(p, 1)),
         Button::BassScroll(d) => Action::Seq(SeqAction::BassScroll(d)),
+        Button::DrumMinus(p) => Action::Seq(SeqAction::DrumAdjust(p, -1)),
+        Button::DrumPlus(p) => Action::Seq(SeqAction::DrumAdjust(p, 1)),
+        Button::DrumBars(n) => Action::Seq(SeqAction::DrumBars(n)),
+        Button::DrumBar(i) => Action::Seq(SeqAction::DrumBar(i)),
+        Button::DrumBarLock => Action::Seq(SeqAction::ToggleDrumBarLock),
+        // pads are handled in `touch` (they need the clock position)
+        Button::DrumPad(i) => Action::Seq(SeqAction::DrumPad(i, None)),
+        Button::DrumStep(k) => Action::Seq(SeqAction::DrumStep(k)),
+        Button::ChannelMinus(i) => Action::Seq(SeqAction::Channel(i, -1)),
+        Button::ChannelPlus(i) => Action::Seq(SeqAction::Channel(i, 1)),
     };
     act(a);
 }

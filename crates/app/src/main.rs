@@ -91,7 +91,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     let manual = path.with_extension("manual.ppm");
     let st2 = ui::Status { mode: Mode::Manual, taps: 3, ..st.clone() };
     std::fs::write(&manual, ui::snapshot(w, h, &st2, Page::Tempo, Some(ui::Button::Tap)))?;
-    let seqp = path.with_extension("seq.ppm");
+    let seqp = path.with_extension("lead.ppm");
     let mut seq = SeqState::default();
     seq.apply(sequencer::SeqAction::Bars(2));
     for k in [0, 4, 8, 12] {
@@ -109,7 +109,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     seq.apply(sequencer::SeqAction::SelectTrack(0));
     seq.apply(sequencer::SeqAction::Bar(0)); // locked to bar 1
     let st3 = ui::Status { seq: Arc::new(seq.clone()), ..st.clone() };
-    std::fs::write(&seqp, ui::snapshot(w, h, &st3, Page::Sequence, None))?;
+    std::fs::write(&seqp, ui::snapshot(w, h, &st3, Page::Lead, None))?;
     let bassp = path.with_extension("bass.ppm");
     use sequencer::SeqAction::{BassBars, BassSet};
     seq.apply(BassBars(4));
@@ -126,9 +126,38 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     seq.apply(BassCellDrag(3));
     seq.apply(BassCellUp);
     seq.apply(BassBar(0));
-    let st4 = ui::Status { seq: Arc::new(seq), ..st };
+    let st4 = ui::Status { seq: Arc::new(seq.clone()), ..st.clone() };
     std::fs::write(&bassp, ui::snapshot(w, h, &st4, Page::Bass, None))?;
-    eprintln!("wrote {}, {}, {} and {}", path.display(), manual.display(), seqp.display(), bassp.display());
+    let drumsp = path.with_extension("drums.ppm");
+    use sequencer::SeqAction::{DrumAdjust, DrumBar, DrumBars, DrumPad, DrumStep};
+    seq.apply(DrumBars(2));
+    for (pad, steps) in [(0, &[0, 8, 10][..]), (1, &[4, 12]), (3, &[4, 12]), (4, &[0, 2, 4, 6, 8, 10, 12, 14]), (5, &[14])] {
+        seq.apply(DrumPad(pad, None));
+        for k in steps {
+            seq.apply(DrumStep(*k));
+        }
+    }
+    seq.apply(DrumPad(4, None));
+    seq.apply(DrumStep(0)); // accent
+    seq.apply(DrumStep(8));
+    seq.apply(DrumAdjust(sequencer::DrumParam::Swing, 8));
+    seq.apply(DrumPad(0, None));
+    seq.apply(DrumBar(0));
+    let st5 = ui::Status { seq: Arc::new(seq.clone()), ..st.clone() };
+    std::fs::write(&drumsp, ui::snapshot(w, h, &st5, Page::Drums, None))?;
+    let setupp = path.with_extension("setup.ppm");
+    seq.apply(sequencer::SeqAction::Channel(sequencer::Instrument::Bass, 1)); // bass on channel 2
+    let st6 = ui::Status { seq: Arc::new(seq), ..st };
+    std::fs::write(&setupp, ui::snapshot(w, h, &st6, Page::Settings, None))?;
+    eprintln!(
+        "wrote {}, {}, {}, {}, {} and {}",
+        path.display(),
+        manual.display(),
+        seqp.display(),
+        bassp.display(),
+        drumsp.display(),
+        setupp.display()
+    );
     Ok(())
 }
 

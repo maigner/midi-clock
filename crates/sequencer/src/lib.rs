@@ -3,9 +3,11 @@
 //! placed on the grid, the notes are on the beat in both auto and manual mode
 //! and follow every correction, like the click and the clock.
 //!
-//! Both the 8-track drum pattern and the single-voice bass line (`Bass`) are
-//! phrases of 1, 2, 4 or 8 bars, played by the same thread. Bars are counted
-//! from the downbeat of the grid, so a phrase always starts on a "1".
+//! The 8-track drum pattern, the single-voice bass line (`Bass`) and the
+//! drum kit (`Drums`: pads, one step row per instrument, accents and swing,
+//! after the DrumBrute) are phrases of 1, 2, 4 or 8 bars, played by the same
+//! thread. Bars are counted from the downbeat of the grid, so a phrase
+//! always starts on a "1".
 //!
 //! `SeqState` is the editable model (UI thread), `Snapshot` what the
 //! real-time thread plays, `run` the thread.
@@ -27,6 +29,14 @@ pub const MAX_STEPS: usize = MAX_BARS * STEPS;
 pub const BASS_ROWS: usize = 8;
 /// Highest `Bass::base`: the top row is then MIDI note 127.
 pub const BASS_TOP: u8 = 127 - (BASS_ROWS as u8 - 1);
+/// Instruments (pads) of the drum kit.
+pub const DRUMS: usize = 10;
+/// Swing of the drum kit in percent: 50 is straight, 75 moves every second
+/// 16th half a step late (the triplet feel is at 67).
+pub const SWING_MIN: u8 = 50;
+pub const SWING_MAX: u8 = 75;
+/// Velocity of an accented drum step.
+pub const ACCENT_VEL: u8 = 127;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
@@ -52,19 +62,21 @@ fn one_step() -> u16 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Track {
-    /// MIDI channel, 0-based (shown 1-based).
-    pub channel: u8,
     /// Note new steps get.
     pub note: u8,
     pub vel: u8,
     pub muted: bool,
     /// `MAX_STEPS` steps; only the pattern's `bars` bars play.
     pub steps: Vec<Step>,
+    /// Files from before the pattern had one channel gave every track its
+    /// own; the first track's becomes the pattern's when such a file loads.
+    #[serde(default, rename = "channel", skip_serializing)]
+    old_channel: Option<u8>,
 }
 
 impl Track {
-    pub fn new(channel: u8, note: u8) -> Self {
-        Self { channel, note, vel: 100, muted: false, steps: vec![Step::default(); MAX_STEPS] }
+    pub fn new(note: u8) -> Self {
+        Self { note, vel: 100, muted: false, steps: vec![Step::default(); MAX_STEPS], old_channel: None }
     }
 }
 
@@ -72,11 +84,19 @@ fn one_bar() -> u8 {
     1
 }
 
+fn drum_channel() -> u8 {
+    9
+}
+
+/// The LEAD phrase: `TRACKS` polyphonic tracks, all on one MIDI channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pattern {
     /// Phrase length in bars: 1, 2, 4 or 8.
     #[serde(default = "one_bar")]
     pub bars: u8,
+    /// MIDI channel of every track, 0-based (shown 1-based).
+    #[serde(default = "drum_channel")]
+    pub channel: u8,
     pub tracks: Vec<Track>,
 }
 
@@ -84,7 +104,7 @@ impl Default for Pattern {
     fn default() -> Self {
         // General MIDI drums on channel 10: kick, snare, closed hat, open hat, clap, low tom, high tom, crash.
         let notes = [36u8, 38, 42, 46, 39, 45, 50, 49];
-        Self { bars: 1, tracks: notes.iter().map(|&n| Track::new(9, n)).collect() }
+        Self { bars: 1, channel: drum_channel(), tracks: notes.iter().map(|&n| Track::new(n)).collect() }
     }
 }
 
@@ -93,13 +113,17 @@ impl Pattern {
         if !matches!(self.bars, 1 | 2 | 4 | 8) {
             self.bars = 1;
         }
-        self.tracks.resize_with(TRACKS, || Track::new(9, 60));
+        if let Some(c) = self.tracks.iter().find_map(|t| t.old_channel) {
+            self.channel = c;
+        }
+        self.channel &= 0x0F;
+        self.tracks.resize_with(TRACKS, || Track::new(60));
         for t in &mut self.tracks {
+            t.old_channel = None;
             t.steps.resize(MAX_STEPS, Step::default());
             for st in &mut t.steps {
                 st.len = st.len.clamp(1, MAX_STEPS as u16);
             }
-            t.channel &= 0x0F;
             t.note &= 0x7F;
             t.vel = t.vel.clamp(1, 127);
         }
@@ -158,18 +182,111 @@ impl Bass {
     }
 }
 
+/// One 16th of a drum instrument: a hit or not, plain or accented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrumStep {
+    pub on: bool,
+    #[serde(default)]
+    pub accent: bool,
+}
+
+/// One instrument (pad) of the drum kit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drum {
+    pub note: u8,
+    /// Velocity of a plain hit; an accented one plays `ACCENT_VEL`.
+    pub vel: u8,
+    pub muted: bool,
+    pub solo: bool,
+    /// `MAX_STEPS` steps; only the kit's `bars` bars play.
+    pub steps: Vec<DrumStep>,
+}
+
+impl Drum {
+    pub fn new(note: u8) -> Self {
+        Self { note, vel: 100, muted: false, solo: false, steps: vec![DrumStep::default(); MAX_STEPS] }
+    }
+}
+
+/// The drum kit of the DRUMS page: `DRUMS` instruments on one MIDI channel,
+/// each with its own row of one-16th hits, a phrase of 1..8 bars and swing
+/// on every second 16th. Worked like a DrumBrute: pick an instrument on its
+/// pad, set its steps, accent some, mute and solo, record pads live.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drums {
+    /// MIDI channel, 0-based.
+    pub channel: u8,
+    /// Phrase length in bars: 1, 2, 4 or 8.
+    pub bars: u8,
+    /// `SWING_MIN..=SWING_MAX` percent.
+    pub swing: u8,
+    pub drums: Vec<Drum>,
+}
+
+impl Default for Drums {
+    fn default() -> Self {
+        // General MIDI: kick, snare, rim, clap, closed hat, open hat, low tom, high tom, crash, ride.
+        let notes = [36u8, 38, 37, 39, 42, 46, 45, 50, 49, 51];
+        Self { channel: 9, bars: 1, swing: SWING_MIN, drums: notes.iter().map(|&n| Drum::new(n)).collect() }
+    }
+}
+
+impl Drums {
+    fn normalise(&mut self) {
+        if !matches!(self.bars, 1 | 2 | 4 | 8) {
+            self.bars = 1;
+        }
+        let defaults = Drums::default();
+        for i in self.drums.len()..DRUMS {
+            self.drums.push(defaults.drums[i].clone());
+        }
+        self.drums.truncate(DRUMS);
+        for d in &mut self.drums {
+            d.steps.resize(MAX_STEPS, DrumStep::default());
+            d.note &= 0x7F;
+            d.vel = d.vel.clamp(1, 127);
+        }
+        self.channel &= 0x0F;
+        self.swing = self.swing.clamp(SWING_MIN, SWING_MAX);
+    }
+
+    /// Whether instrument `i` sounds: not muted and, while any instrument is
+    /// soloed, one of the soloed.
+    pub fn audible(&self, i: usize) -> bool {
+        let d = &self.drums[i];
+        !d.muted && (d.solo || !self.drums.iter().any(|d| d.solo))
+    }
+
+    /// How far every second 16th plays late, in steps: 0 at 50 % swing,
+    /// 0.5 at 75 %.
+    pub fn swing_shift(&self) -> f64 {
+        (self.swing.clamp(SWING_MIN, SWING_MAX) - SWING_MIN) as f64 / 50.0
+    }
+}
+
+/// Pad hit to play right away: the screen's pad was tapped. A new `serial`
+/// for every tap, so the playing thread fires each once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PadHit {
+    pub serial: u64,
+    pub channel: u8,
+    pub note: u8,
+    pub vel: u8,
+}
+
 /// What the playing thread needs; replaced wholesale on every edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub pattern: Pattern,
     pub playing: bool,
     pub bass: Bass,
+    pub drums: Drums,
+    pub hit: Option<PadHit>,
 }
 
 /// Which track parameter a +/- press changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Param {
-    Channel,
     Note,
     Velocity,
 }
@@ -179,6 +296,55 @@ pub enum Param {
 pub enum BassParam {
     Channel,
     Velocity,
+}
+
+/// Which drum kit parameter a +/- press changes: the kit's channel and
+/// swing, the selected instrument's note and velocity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrumParam {
+    Channel,
+    Note,
+    Velocity,
+    Swing,
+}
+
+/// What the next pad taps on the DRUMS page do, as the MUTE / SOLO / ERASE
+/// buttons of a DrumBrute: armed, a pad toggles its instrument's mute or
+/// solo, or erases its steps, instead of selecting and playing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DrumArm {
+    #[default]
+    Off,
+    Mute,
+    Solo,
+    Clear,
+}
+
+/// Where the clock is when a pad is tapped: the nearest 16th of the drum
+/// phrase, and whether that 16th is still to come (the sequencer then plays
+/// the recorded step itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecPos {
+    pub bar: usize,
+    pub step: usize,
+    pub ahead: bool,
+}
+
+/// One of the things the sequencer plays, each on its own MIDI channel: the
+/// LEAD pattern (all its tracks together), the bass line, or the drum kit.
+/// The SETUP page lists them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instrument {
+    Lead,
+    Bass,
+    Drums,
+}
+
+impl Instrument {
+    /// Every instrument, in the order the SETUP page shows them.
+    pub fn all() -> impl Iterator<Item = Instrument> {
+        [Instrument::Lead, Instrument::Bass, Instrument::Drums].into_iter()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,6 +410,30 @@ pub enum SeqAction {
     /// Bass: scroll the pitch window on screen by this many semitones
     /// (the notes stay where they are).
     BassScroll(i32),
+    /// Drums: a tap on pad `i`. Selects the instrument and plays it at
+    /// once; with REC on and the clock running (`pos` says where it is) the
+    /// hit is also written to the nearest 16th. While MUTE or SOLO is armed
+    /// the tap toggles that for the instrument instead; while CLEAR is
+    /// armed it erases the instrument's steps and disarms.
+    DrumPad(usize, Option<RecPos>),
+    /// Drums: a tap on step `k` of the shown bar for the selected
+    /// instrument: off -> hit -> accented hit -> off.
+    DrumStep(usize),
+    /// Drums: phrase length in bars (1, 2, 4 or 8).
+    DrumBars(u8),
+    /// Drums: which bar the screen shows and edits (and stays on).
+    DrumBar(usize),
+    /// Drums: the clock moved on to this bar; show it unless locked.
+    DrumFollowBar(usize),
+    ToggleDrumBarLock,
+    DrumAdjust(DrumParam, i32),
+    /// Drums: arm MUTE, SOLO or CLEAR for the pads; the same again disarms.
+    DrumArm(DrumArm),
+    /// Drums: live recording of pad taps on and off.
+    ToggleDrumRec,
+    /// SETUP: move an instrument's MIDI channel by this much (clamped to
+    /// 1..16). The lead's channel is the current pattern's.
+    Channel(Instrument, i32),
 }
 
 impl SeqAction {
@@ -258,6 +448,11 @@ impl SeqAction {
                 | SeqAction::BassBar(_)
                 | SeqAction::BassFollowBar(_)
                 | SeqAction::ToggleBassBarLock
+                | SeqAction::DrumBar(_)
+                | SeqAction::DrumFollowBar(_)
+                | SeqAction::ToggleDrumBarLock
+                | SeqAction::DrumArm(_)
+                | SeqAction::ToggleDrumRec
         )
     }
 }
@@ -268,6 +463,8 @@ struct File {
     current: usize,
     #[serde(default)]
     bass: Bass,
+    #[serde(default)]
+    drums: Drums,
 }
 
 /// The editable model. Every method that changes something returns true, so
@@ -291,6 +488,19 @@ pub struct SeqState {
     pub bass_bar: usize,
     /// As `bar_lock`, for the bass page.
     pub bass_bar_lock: bool,
+    pub drums: Drums,
+    /// Selected instrument of the drum kit (its steps are on screen).
+    pub drum: usize,
+    /// Bar of the drum phrase shown on screen.
+    pub drum_bar: usize,
+    /// As `bar_lock`, for the drums page.
+    pub drum_bar_lock: bool,
+    /// What pad taps do at the moment.
+    pub drum_arm: DrumArm,
+    /// Pad taps are written to the phrase while the clock runs.
+    pub drum_rec: bool,
+    /// The last pad tap, for the playing thread.
+    hit: Option<PadHit>,
     /// A finger dragging a note's length on one of the grids.
     drag: Option<Drag>,
 }
@@ -329,6 +539,13 @@ impl Default for SeqState {
             bass: Bass::default(),
             bass_bar: 0,
             bass_bar_lock: false,
+            drums: Drums::default(),
+            drum: 0,
+            drum_bar: 0,
+            drum_bar_lock: false,
+            drum_arm: DrumArm::Off,
+            drum_rec: false,
+            hit: None,
             drag: None,
         }
     }
@@ -344,15 +561,27 @@ impl SeqState {
         self.bar.min(self.pattern().bars.max(1) as usize - 1)
     }
 
+    /// The bar of the drum phrase shown for editing, clamped to its length.
+    pub fn drum_shown_bar(&self) -> usize {
+        self.drum_bar.min(self.drums.bars.max(1) as usize - 1)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot { pattern: self.patterns[self.current].clone(), playing: self.playing, bass: self.bass.clone() }
+        Snapshot {
+            pattern: self.patterns[self.current].clone(),
+            playing: self.playing,
+            bass: self.bass.clone(),
+            drums: self.drums.clone(),
+            hit: self.hit,
+        }
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let f: File = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, ..SeqState::default() };
+        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, drums: f.drums, ..SeqState::default() };
         s.bass.normalise();
+        s.drums.normalise();
         s.patterns.resize_with(PATTERNS, Pattern::default);
         s.patterns.truncate(PATTERNS);
         for p in &mut s.patterns {
@@ -363,7 +592,7 @@ impl SeqState {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone() };
+        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone(), drums: self.drums.clone() };
         let text = toml::to_string(&f).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -522,7 +751,6 @@ impl SeqState {
                     (Param::Velocity, Some(k)) => tr.steps[k].vel = bump(tr.steps[k].vel, 1, 127),
                     (Param::Note, None) => tr.note = bump(tr.note, 0, 127),
                     (Param::Velocity, None) => tr.vel = bump(tr.vel, 1, 127),
-                    (Param::Channel, _) => tr.channel = bump(tr.channel, 0, 15),
                 }
                 true
             }
@@ -691,6 +919,130 @@ impl SeqState {
                 self.bass.base = base;
                 true
             }
+            SeqAction::DrumPad(i, pos) => {
+                if i >= DRUMS {
+                    return false;
+                }
+                let d = &mut self.drums.drums[i];
+                match self.drum_arm {
+                    DrumArm::Mute => d.muted = !d.muted,
+                    DrumArm::Solo => d.solo = !d.solo,
+                    DrumArm::Clear => {
+                        for st in &mut d.steps {
+                            *st = DrumStep::default();
+                        }
+                        self.drum = i;
+                        self.drum_arm = DrumArm::Off;
+                    }
+                    DrumArm::Off => {
+                        self.drum = i;
+                        // Recording: the hit goes on the nearest 16th. If that
+                        // 16th is still ahead the sequencer plays it from
+                        // there, so the pad stays quiet rather than flam.
+                        let mut play = true;
+                        if let Some(p) = pos.filter(|_| self.drum_rec) {
+                            if p.bar < self.drums.bars.max(1) as usize && p.step < STEPS {
+                                let st = &mut d.steps[p.bar * STEPS + p.step];
+                                if !st.on {
+                                    *st = DrumStep { on: true, accent: false };
+                                }
+                                play = !p.ahead;
+                            }
+                        }
+                        if play {
+                            let serial = self.hit.map_or(0, |h| h.serial) + 1;
+                            self.hit = Some(PadHit { serial, channel: self.drums.channel, note: d.note, vel: d.vel });
+                        }
+                    }
+                }
+                true
+            }
+            SeqAction::DrumStep(k) => {
+                if k >= STEPS {
+                    return false;
+                }
+                let idx = self.drum_shown_bar() * STEPS + k;
+                let st = &mut self.drums.drums[self.drum.min(DRUMS - 1)].steps[idx];
+                *st = match (st.on, st.accent) {
+                    (false, _) => DrumStep { on: true, accent: false },
+                    (true, false) => DrumStep { on: true, accent: true },
+                    (true, true) => DrumStep::default(),
+                };
+                true
+            }
+            SeqAction::DrumBars(n) => {
+                if !matches!(n, 1 | 2 | 4 | 8) {
+                    return false;
+                }
+                let old = self.drums.bars.max(1) as usize;
+                for d in &mut self.drums.drums {
+                    extend_bars(&mut d.steps, old, n as usize);
+                }
+                self.drums.bars = n;
+                self.drum_bar = self.drum_bar.min(n as usize - 1);
+                true
+            }
+            SeqAction::DrumBar(b) => {
+                if b >= self.drums.bars as usize {
+                    return false;
+                }
+                self.drum_bar = b;
+                self.drum_bar_lock = true;
+                true
+            }
+            SeqAction::DrumFollowBar(b) => {
+                if self.drum_bar_lock || b >= self.drums.bars as usize || self.drum_bar == b {
+                    return false;
+                }
+                self.drum_bar = b;
+                true
+            }
+            SeqAction::ToggleDrumBarLock => {
+                self.drum_bar_lock = !self.drum_bar_lock;
+                true
+            }
+            SeqAction::DrumAdjust(param, d) => {
+                let bump = |v: u8, lo: u8, hi: u8| (v as i32 + d).clamp(lo as i32, hi as i32) as u8;
+                let k = &mut self.drums;
+                let dr = &mut k.drums[self.drum.min(DRUMS - 1)];
+                match param {
+                    DrumParam::Channel => k.channel = bump(k.channel, 0, 15),
+                    DrumParam::Note => dr.note = bump(dr.note, 0, 127),
+                    DrumParam::Velocity => dr.vel = bump(dr.vel, 1, 127),
+                    DrumParam::Swing => k.swing = bump(k.swing, SWING_MIN, SWING_MAX),
+                }
+                true
+            }
+            SeqAction::DrumArm(a) => {
+                self.drum_arm = if self.drum_arm == a { DrumArm::Off } else { a };
+                true
+            }
+            SeqAction::ToggleDrumRec => {
+                self.drum_rec = !self.drum_rec;
+                true
+            }
+            SeqAction::Channel(inst, d) => {
+                let ch = match inst {
+                    Instrument::Lead => &mut self.patterns[cur].channel,
+                    Instrument::Bass => &mut self.bass.channel,
+                    Instrument::Drums => &mut self.drums.channel,
+                };
+                let new = (*ch as i32 + d).clamp(0, 15) as u8;
+                if new == *ch {
+                    return false;
+                }
+                *ch = new;
+                true
+            }
+        }
+    }
+
+    /// The MIDI channel (0-based) an instrument plays on.
+    pub fn channel(&self, inst: Instrument) -> u8 {
+        match inst {
+            Instrument::Lead => self.pattern().channel,
+            Instrument::Bass => self.bass.channel,
+            Instrument::Drums => self.drums.channel,
         }
     }
 }
@@ -776,6 +1128,47 @@ pub fn note_name(n: u8) -> String {
     format!("{}{}", NAMES[(n % 12) as usize], (n / 12) as i32 - 2)
 }
 
+/// Short name of a General MIDI percussion note for the pads ("KICK",
+/// "SNARE", ...), the note name for anything else.
+pub fn drum_name(n: u8) -> String {
+    let s = match n {
+        35 => "KICK2",
+        36 => "KICK",
+        37 => "RIM",
+        38 => "SNARE",
+        39 => "CLAP",
+        40 => "SNAR2",
+        41 | 43 => "FTOM",
+        42 => "CHAT",
+        44 => "PHAT",
+        45 => "LTOM",
+        46 => "OHAT",
+        47 | 48 => "MTOM",
+        49 => "CRASH",
+        50 => "HTOM",
+        51 => "RIDE",
+        52 => "CHINA",
+        53 => "BELL",
+        54 => "TAMB",
+        55 => "SPLSH",
+        56 => "COWBL",
+        57 => "CRSH2",
+        59 => "RIDE2",
+        60 | 61 => "BONGO",
+        62..=64 => "CONGA",
+        65 | 66 => "TIMB",
+        67 | 68 => "AGOGO",
+        69 => "CABSA",
+        70 => "MARAC",
+        75 => "CLAVE",
+        76 | 77 => "WBLCK",
+        80 | 81 => "TRIAN",
+        82 => "SHAKR",
+        _ => return note_name(n),
+    };
+    s.to_string()
+}
+
 /// Bar (counted from the grid's downbeat, may be negative) and step in that
 /// bar for beat `n` and 16th `sub` (0..3).
 #[inline]
@@ -813,6 +1206,19 @@ pub fn phrase_playhead(g: &Grid, t: f64, bars: usize) -> Option<(usize, usize)> 
     })
 }
 
+/// The 16th nearest to `t` in a phrase of `bars` bars, for recording a pad
+/// tap; `None` while the clock stands.
+pub fn phrase_nearest(g: &Grid, t: f64, bars: usize) -> Option<RecPos> {
+    if !g.running || g.period <= 0.0 {
+        return None;
+    }
+    let x = (t - g.t0) / g.period * 4.0;
+    let q = x.round() as i64;
+    let (n, sub) = (g.n0 + q.div_euclid(4), q.rem_euclid(4));
+    let (bar, step) = bar_and_step(g, n, sub);
+    Some(RecPos { bar: bar.rem_euclid(bars.max(1) as i64) as usize, step, ahead: q as f64 > x })
+}
+
 /// Where notes go. `MidiOut` for real, a recorder for tests and the simulator.
 pub trait NoteOut {
     fn note_on(&self, channel: u8, note: u8, vel: u8) -> bool;
@@ -834,6 +1240,10 @@ pub struct SeqStats {
     pub errors: AtomicU64,
 }
 
+/// `Pending::epoch` of a note-off at a fixed time (a pad hit): never
+/// re-anchored to the grid.
+const NO_EPOCH: u32 = u32::MAX;
+
 #[derive(Clone, Copy)]
 struct Pending {
     /// Beat and 16th of the note-off, on the grid of `epoch`; `t_off` is
@@ -842,11 +1252,46 @@ struct Pending {
     n: i64,
     sub: i64,
     epoch: u32,
+    /// Swing: how many steps after the 16th the note-off falls.
+    shift: f64,
     t_off: f64,
     channel: u8,
     note: u8,
     /// True for the bass voice, which is monophonic.
     bass: bool,
+}
+
+/// A drum hit the swing holds back: it goes out `shift` steps after its 16th.
+#[derive(Clone, Copy)]
+struct Delayed {
+    n: i64,
+    sub: i64,
+    epoch: u32,
+    shift: f64,
+    t_on: f64,
+    channel: u8,
+    note: u8,
+    vel: u8,
+}
+
+/// Send a note-on and remember its note-off `p`. The same note still
+/// sounding on that channel is released first (a repeat inside a long
+/// note), so the synth gets a clean off/on.
+fn strike(midi: &dyn NoteOut, stats: &SeqStats, pending: &mut Vec<Pending>, vel: u8, p: Pending) {
+    if let Some(i) = pending.iter().position(|q| q.channel == p.channel && q.note == p.note) {
+        let q = pending.swap_remove(i);
+        let _ = midi.note_off(q.channel, q.note);
+    }
+    if !midi.note_on(p.channel, p.note, vel) {
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.notes.fetch_add(1, Ordering::Relaxed);
+    }
+    if pending.len() < pending.capacity() {
+        pending.push(p);
+    } else {
+        let _ = midi.note_off(p.channel, p.note);
+    }
 }
 
 /// The sequencer thread body. Runs until `stop` is set.
@@ -859,18 +1304,34 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
     stats: &SeqStats,
 ) {
     let poll = 0.0015;
-    let mut pending: Vec<Pending> = Vec::with_capacity(TRACKS * 8 + 1);
+    let mut pending: Vec<Pending> = Vec::with_capacity(TRACKS * 8 + DRUMS * 2 + 2);
+    let mut delayed: Vec<Delayed> = Vec::with_capacity(DRUMS * 2);
     // Last 16th played, as an absolute index (beat * 4 + 16th). Absolute, not
     // relative to `n0`: the tracker re-anchors `n0`/`t0` every tempo
     // estimate while beat numbers stay put.
     let mut last_a: Option<i64> = None;
     let mut epoch = u32::MAX;
+    // Serial of the last pad hit seen; the first snapshot's is adopted, not
+    // played (it may be a tap from before the thread started).
+    let mut last_hit: Option<u64> = None;
     let all_off = |pending: &mut Vec<Pending>| {
         for p in pending.drain(..) {
             if !midi.note_off(p.channel, p.note) {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+    };
+    let offs_due = |pending: &mut Vec<Pending>, t: f64| {
+        pending.retain(|p| {
+            if p.t_off <= t {
+                if !midi.note_off(p.channel, p.note) {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            } else {
+                true
+            }
+        });
     };
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -881,26 +1342,33 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         let snap = get_snapshot();
         let tnow = now();
         if g.running {
+            let step_len = g.period / 4.0;
             for p in &mut pending {
                 if p.epoch == g.epoch {
-                    p.t_off = g.tick_time(p.n, (p.sub * 6) as u32) - lead_s;
+                    p.t_off = g.tick_time(p.n, (p.sub * 6) as u32) + p.shift * step_len - lead_s;
+                }
+            }
+            for d in &mut delayed {
+                if d.epoch == g.epoch {
+                    d.t_on = g.tick_time(d.n, (d.sub * 6) as u32) + d.shift * step_len - lead_s;
                 }
             }
         }
+        // A pad tapped on the screen plays at once, clock or no clock.
+        let serial = snap.hit.map_or(0, |h| h.serial);
+        if let (Some(h), Some(last)) = (snap.hit, last_hit) {
+            if h.serial > last {
+                let p = Pending { n: 0, sub: 0, epoch: NO_EPOCH, shift: 0.0, t_off: tnow + 0.1, channel: h.channel, note: h.note, bass: false };
+                strike(midi, stats, &mut pending, h.vel, p);
+            }
+        }
+        last_hit = Some(serial);
         // Note-offs are due regardless of the clock state.
         let next_off = pending.iter().map(|p| p.t_off).fold(f64::INFINITY, f64::min);
         if !g.running || !snap.playing {
+            delayed.clear();
             if !pending.is_empty() && next_off <= tnow {
-                pending.retain(|p| {
-                    if p.t_off <= tnow {
-                        if !midi.note_off(p.channel, p.note) {
-                            stats.errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                });
+                offs_due(&mut pending, tnow);
             }
             last_a = None;
             sleep_until(tnow + 0.002);
@@ -925,7 +1393,8 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         let n = a.div_euclid(4);
         let sub = a.rem_euclid(4);
         let t_on = g.tick_time(n, (sub * 6) as u32) - lead_s;
-        let next = t_on.min(next_off);
+        let next_delayed = delayed.iter().map(|d| d.t_on).fold(f64::INFINITY, f64::min);
+        let next = t_on.min(next_off).min(next_delayed);
         if next - tnow > poll {
             sleep_until(tnow + poll);
             continue;
@@ -933,24 +1402,27 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         sleep_until(next);
         let t = now();
         // Note-offs first, so a retriggered note gets a clean off/on.
-        pending.retain(|p| {
-            if p.t_off <= t + 0.0002 {
-                if !midi.note_off(p.channel, p.note) {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-                false
-            } else {
-                true
+        offs_due(&mut pending, t + 0.0002);
+        // Note-off `len` steps after 16th `a0`: beat, 16th and time on this grid.
+        let off = |a0: i64, len: u16, shift: f64| {
+            let a_off = a0 + len.max(1) as i64;
+            let (n_off, sub_off) = (a_off.div_euclid(4), a_off.rem_euclid(4));
+            (n_off, sub_off, g.tick_time(n_off, (sub_off * 6) as u32) + shift * step_len - lead_s)
+        };
+        // Swung drum hits that are due.
+        let mut i = 0;
+        while i < delayed.len() {
+            if delayed[i].t_on > t + 0.0002 {
+                i += 1;
+                continue;
             }
-        });
+            let d = delayed.swap_remove(i);
+            let (n_off, sub_off, t_off) = off(d.n * 4 + d.sub, 1, d.shift);
+            let p = Pending { n: n_off, sub: sub_off, epoch: d.epoch, shift: d.shift, t_off, channel: d.channel, note: d.note, bass: false };
+            strike(midi, stats, &mut pending, d.vel, p);
+        }
         if t_on <= t + 0.0002 {
             let (bar, k) = bar_and_step(&g, n, sub);
-            // Note-off `len` steps on: beat, 16th and time on this grid.
-            let off = |len: u16| {
-                let a_off = a + len.max(1) as i64;
-                let (n_off, sub_off) = (a_off.div_euclid(4), a_off.rem_euclid(4));
-                (n_off, sub_off, g.tick_time(n_off, (sub_off * 6) as u32) - lead_s)
-            };
             let pidx = bar.rem_euclid(snap.pattern.bars.max(1) as i64) as usize * STEPS + k;
             for tr in &snap.pattern.tracks {
                 if tr.muted {
@@ -960,22 +1432,9 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                 if !st.on {
                     continue;
                 }
-                // Kill the same note if it is still sounding (a repeat inside a long note).
-                if let Some(i) = pending.iter().position(|p| p.channel == tr.channel && p.note == st.note) {
-                    let p = pending.swap_remove(i);
-                    let _ = midi.note_off(p.channel, p.note);
-                }
-                if !midi.note_on(tr.channel, st.note, st.vel) {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.notes.fetch_add(1, Ordering::Relaxed);
-                }
-                let (n_off, sub_off, t_off) = off(st.len);
-                if pending.len() < pending.capacity() {
-                    pending.push(Pending { n: n_off, sub: sub_off, epoch: g.epoch, t_off, channel: tr.channel, note: st.note, bass: false });
-                } else {
-                    let _ = midi.note_off(tr.channel, st.note);
-                }
+                let (n_off, sub_off, t_off) = off(a, st.len, 0.0);
+                let p = Pending { n: n_off, sub: sub_off, epoch: g.epoch, shift: 0.0, t_off, channel: snap.pattern.channel, note: st.note, bass: false };
+                strike(midi, stats, &mut pending, st.vel, p);
             }
             // --- bass: one voice, the phrase wraps every `bars` bars ------------
             let b = &snap.bass;
@@ -989,16 +1448,28 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                     }
                     !p.bass
                 });
-                if !midi.note_on(b.channel, st.note, b.vel) {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.notes.fetch_add(1, Ordering::Relaxed);
+                let (n_off, sub_off, t_off) = off(a, st.len, 0.0);
+                let p = Pending { n: n_off, sub: sub_off, epoch: g.epoch, shift: 0.0, t_off, channel: b.channel, note: st.note, bass: true };
+                strike(midi, stats, &mut pending, b.vel, p);
+            }
+            // --- drums: one-16th hits, plain or accented; every second 16th
+            // is held back by the swing and fired from `delayed`.
+            let d = &snap.drums;
+            let idx = bar.rem_euclid(d.bars.max(1) as i64) as usize * STEPS + k;
+            let shift = if k % 2 == 1 { d.swing_shift() } else { 0.0 };
+            for (i, dr) in d.drums.iter().enumerate().take(DRUMS) {
+                let Some(st) = dr.steps.get(idx).filter(|st| st.on) else { continue };
+                if !d.audible(i) {
+                    continue;
                 }
-                let (n_off, sub_off, t_off) = off(st.len);
-                if pending.len() < pending.capacity() {
-                    pending.push(Pending { n: n_off, sub: sub_off, epoch: g.epoch, t_off, channel: b.channel, note: st.note, bass: true });
+                let vel = if st.accent { ACCENT_VEL } else { dr.vel };
+                if shift > 0.0 && delayed.len() < delayed.capacity() {
+                    let t_on = t_on + shift * step_len;
+                    delayed.push(Delayed { n, sub, epoch: g.epoch, shift, t_on, channel: d.channel, note: dr.note, vel });
                 } else {
-                    let _ = midi.note_off(b.channel, st.note);
+                    let (n_off, sub_off, t_off) = off(a, 1, 0.0);
+                    let p = Pending { n: n_off, sub: sub_off, epoch: g.epoch, shift: 0.0, t_off, channel: d.channel, note: dr.note, bass: false };
+                    strike(midi, stats, &mut pending, vel, p);
                 }
             }
             last_a = Some(a);
@@ -1009,6 +1480,49 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_page_channels() {
+        use SeqAction as A;
+        let mut s = SeqState::default();
+        let all: Vec<_> = Instrument::all().collect();
+        assert_eq!(all, [Instrument::Lead, Instrument::Bass, Instrument::Drums]);
+        assert_eq!((s.channel(Instrument::Lead), s.channel(Instrument::Bass), s.channel(Instrument::Drums)), (9, 0, 9));
+        // each instrument on its own, the others untouched
+        assert!(s.apply(A::Channel(Instrument::Lead, 1)));
+        assert_eq!(s.pattern().channel, 10);
+        assert_eq!(s.patterns[1].channel, 9, "the other patterns keep theirs");
+        assert_eq!(s.drums.channel, 9);
+        assert!(s.apply(A::Channel(Instrument::Bass, 3)));
+        assert_eq!(s.bass.channel, 3);
+        assert!(s.apply(A::Channel(Instrument::Drums, -1)));
+        assert_eq!(s.drums.channel, 8);
+        // clamped to the 16 channels; nothing to save when nothing moved
+        assert!(s.apply(A::Channel(Instrument::Bass, -100)));
+        assert_eq!(s.bass.channel, 0);
+        assert!(!s.apply(A::Channel(Instrument::Bass, -1)));
+        assert!(s.apply(A::Channel(Instrument::Drums, 100)));
+        assert_eq!(s.drums.channel, 15);
+        assert!(!s.apply(A::Channel(Instrument::Drums, 1)));
+        assert!(!A::Channel(Instrument::Bass, 1).view_only(), "a channel change is played and saved");
+        // the playing thread sees it
+        assert_eq!(s.snapshot().bass.channel, 0);
+        assert_eq!(s.snapshot().pattern.channel, 10);
+        // a file from when every track had a channel: the first track's is the pattern's
+        let old = "current = 0\n[[patterns]]\n[[patterns.tracks]]\nchannel = 3\nnote = 36\nvel = 100\nmuted = false\nsteps = []\n[[patterns.tracks]]\nchannel = 5\nnote = 38\nvel = 100\nmuted = false\nsteps = []\n";
+        let dir = std::env::temp_dir().join(format!("chan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patterns.toml");
+        std::fs::write(&path, old).unwrap();
+        let l = SeqState::load(&path).unwrap();
+        assert_eq!(l.pattern().channel, 3);
+        assert_eq!(l.patterns[1].channel, 9, "patterns the file did not have get the default");
+        l.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("channel = 3\n") && !text.contains("channel = 5"), "saved once, for the pattern:\n{text}");
+        assert_eq!(SeqState::load(&path).unwrap().pattern().channel, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn toggle_and_edit_steps() {
@@ -1090,8 +1604,8 @@ mod tests {
     #[test]
     fn adjust_clamps() {
         let mut s = SeqState::default();
-        s.apply(SeqAction::Adjust(Param::Channel, -20));
-        assert_eq!(s.pattern().tracks[0].channel, 0);
+        s.apply(SeqAction::Adjust(Param::Note, -500));
+        assert_eq!(s.pattern().tracks[0].note, 0);
         s.apply(SeqAction::Adjust(Param::Velocity, -500));
         assert_eq!(s.pattern().tracks[0].vel, 1);
     }
@@ -1213,14 +1727,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    struct Recorder(std::sync::Mutex<Vec<(f64, bool, u8, u8)>>);
+    /// (time, on?, channel, note, velocity)
+    type Event = (f64, bool, u8, u8, u8);
+    struct Recorder(std::sync::Mutex<Vec<Event>>);
     impl NoteOut for Recorder {
-        fn note_on(&self, channel: u8, note: u8, _vel: u8) -> bool {
-            self.0.lock().unwrap().push((now(), true, channel, note));
+        fn note_on(&self, channel: u8, note: u8, vel: u8) -> bool {
+            self.0.lock().unwrap().push((now(), true, channel, note, vel));
             true
         }
         fn note_off(&self, channel: u8, note: u8) -> bool {
-            self.0.lock().unwrap().push((now(), false, channel, note));
+            self.0.lock().unwrap().push((now(), false, channel, note, 0));
             true
         }
     }
@@ -1413,6 +1929,196 @@ mod tests {
     }
 
     #[test]
+    fn drum_edits_and_round_trip() {
+        use SeqAction as A;
+        let mut s = SeqState::default();
+        assert_eq!(s.drums.bars, 1);
+        assert_eq!(s.snapshot().hit, None);
+        // a pad tap selects the instrument and plays it
+        assert!(s.apply(A::DrumPad(1, None)));
+        assert_eq!(s.drum, 1);
+        let hit = s.snapshot().hit.unwrap();
+        assert_eq!((hit.serial, hit.channel, hit.note, hit.vel), (1, 9, 38, 100));
+        // step taps cycle off -> hit -> accent -> off on the selected pad
+        assert!(s.apply(A::DrumStep(4)));
+        assert_eq!(s.drums.drums[1].steps[4], DrumStep { on: true, accent: false });
+        assert!(s.apply(A::DrumStep(4)));
+        assert_eq!(s.drums.drums[1].steps[4], DrumStep { on: true, accent: true });
+        assert!(s.apply(A::DrumStep(4)));
+        assert!(!s.drums.drums[1].steps[4].on);
+        assert!(!s.apply(A::DrumStep(16)) && !s.apply(A::DrumPad(DRUMS, None)));
+        // MUTE, SOLO and CLEAR are armed, then applied by pad taps, which
+        // then neither select nor play
+        s.apply(A::DrumStep(0));
+        assert!(s.apply(A::DrumArm(DrumArm::Mute)));
+        assert!(s.apply(A::DrumPad(0, None)));
+        assert!(s.drums.drums[0].muted && s.drum == 1);
+        assert_eq!(s.snapshot().hit.unwrap().serial, 1, "no hit while armed");
+        assert!(!s.drums.audible(0) && s.drums.audible(1));
+        assert!(s.apply(A::DrumArm(DrumArm::Solo)));
+        assert_eq!(s.drum_arm, DrumArm::Solo);
+        s.apply(A::DrumPad(2, None));
+        assert!(s.drums.drums[2].solo && !s.drums.audible(1) && s.drums.audible(2));
+        assert!(s.apply(A::DrumArm(DrumArm::Solo)), "the same button again disarms");
+        assert_eq!(s.drum_arm, DrumArm::Off);
+        for (arm, pad) in [(DrumArm::Mute, 0), (DrumArm::Solo, 2)] {
+            s.apply(A::DrumArm(arm));
+            s.apply(A::DrumPad(pad, None));
+            s.apply(A::DrumArm(arm));
+        }
+        assert!((0..DRUMS).all(|i| s.drums.audible(i)));
+        s.apply(A::DrumArm(DrumArm::Clear));
+        s.apply(A::DrumPad(1, None));
+        assert!(s.drums.drums[1].steps.iter().all(|st| !st.on));
+        assert_eq!(s.drum_arm, DrumArm::Off, "clear disarms itself");
+        // parameters
+        s.apply(A::DrumAdjust(DrumParam::Swing, 100));
+        assert_eq!(s.drums.swing, SWING_MAX);
+        assert!((s.drums.swing_shift() - 0.5).abs() < 1e-9);
+        s.apply(A::DrumAdjust(DrumParam::Swing, -100));
+        assert_eq!(s.drums.swing, SWING_MIN);
+        assert_eq!(s.drums.swing_shift(), 0.0);
+        s.apply(A::DrumAdjust(DrumParam::Note, 4));
+        assert_eq!(s.drums.drums[1].note, 42);
+        s.apply(A::DrumAdjust(DrumParam::Channel, -20));
+        assert_eq!(s.drums.channel, 0);
+        s.apply(A::DrumAdjust(DrumParam::Velocity, 100));
+        assert_eq!(s.drums.drums[1].vel, 127);
+        // bars, as the other phrases
+        s.apply(A::DrumStep(3));
+        assert!(s.apply(A::DrumBars(4)));
+        assert!(s.apply(A::DrumBar(3)));
+        assert!(s.drum_bar_lock);
+        assert!(s.drums.drums[1].steps[3 * STEPS + 3].on, "copied into the new bars");
+        s.apply(A::DrumStep(3)); // accent in bar 4 only
+        assert!(s.drums.drums[1].steps[3 * STEPS + 3].accent && !s.drums.drums[1].steps[3].accent);
+        assert!(!s.apply(A::DrumFollowBar(1)), "locked");
+        s.apply(A::ToggleDrumBarLock);
+        assert!(s.apply(A::DrumFollowBar(1)));
+        assert_eq!(s.drum_shown_bar(), 1);
+        assert!(!s.apply(A::DrumBar(4)));
+        assert!(A::DrumFollowBar(0).view_only() && A::DrumArm(DrumArm::Mute).view_only() && A::ToggleDrumRec.view_only());
+        assert!(!A::DrumPad(0, None).view_only() && !A::DrumStep(0).view_only());
+        // recording: a pad tap lands on the given 16th; when that 16th is
+        // still ahead the sequencer plays it and the pad stays quiet
+        assert!(s.apply(A::ToggleDrumRec));
+        let serial = s.snapshot().hit.unwrap().serial;
+        s.apply(A::DrumPad(3, Some(RecPos { bar: 2, step: 7, ahead: false })));
+        assert!(s.drums.drums[3].steps[2 * STEPS + 7].on);
+        assert_eq!(s.snapshot().hit.unwrap().serial, serial + 1);
+        s.apply(A::DrumPad(3, Some(RecPos { bar: 2, step: 9, ahead: true })));
+        assert!(s.drums.drums[3].steps[2 * STEPS + 9].on);
+        assert_eq!(s.snapshot().hit.unwrap().serial, serial + 1);
+        s.apply(A::ToggleDrumRec);
+        s.apply(A::DrumPad(3, Some(RecPos { bar: 2, step: 11, ahead: false })));
+        assert!(!s.drums.drums[3].steps[2 * STEPS + 11].on, "REC off");
+        assert_eq!(s.snapshot().hit.unwrap().serial, serial + 2);
+        // round trip; a file from before the kit gets the default kit
+        let dir = std::env::temp_dir().join(format!("drums-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patterns.toml");
+        s.save(&path).unwrap();
+        let l = SeqState::load(&path).unwrap();
+        assert_eq!(l.drums, s.drums);
+        assert_eq!(l.snapshot().hit, None);
+        std::fs::write(&path, "current = 0\n[[patterns]]\n[[patterns.tracks]]\nchannel = 9\nnote = 36\nvel = 100\nmuted = false\nsteps = []\n").unwrap();
+        assert_eq!(SeqState::load(&path).unwrap().drums, Drums::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(drum_name(36), "KICK");
+        assert_eq!(drum_name(100), "E6");
+    }
+
+    #[test]
+    fn drums_play_with_swing_accent_mute_and_solo() {
+        use SeqAction as A;
+        // 240 BPM, one bar: an accented kick on step 0 and a plain one on
+        // step 8, the closed hat on steps 0..3 with the swing at 75 % (the
+        // odd 16ths play half a step late), a muted snare on step 4.
+        let mut st = SeqState::default();
+        st.apply(A::DrumPad(0, None));
+        st.apply(A::DrumStep(0));
+        st.apply(A::DrumStep(0));
+        st.apply(A::DrumStep(8));
+        st.apply(A::DrumPad(4, None));
+        for k in 0..4 {
+            st.apply(A::DrumStep(k));
+        }
+        st.apply(A::DrumPad(1, None));
+        st.apply(A::DrumStep(4));
+        st.apply(A::DrumArm(DrumArm::Mute));
+        st.apply(A::DrumPad(1, None));
+        st.apply(A::DrumArm(DrumArm::Mute));
+        st.apply(A::DrumAdjust(DrumParam::Swing, 25));
+        assert!(st.snapshot().hit.is_some(), "pad taps from before the thread starts must not play");
+        let snap = std::sync::Arc::new(st.snapshot());
+        let t0 = now() + 0.05;
+        let grid = Grid { running: true, epoch: 1, t0, n0: 0, period: 0.25, ..Grid::default() };
+        let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+        let stop = AtomicBool::new(false);
+        let stats = SeqStats::default();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sleep_until(t0 + 1.02);
+                stop.store(true, Ordering::Relaxed);
+            });
+            run(|| grid, || snap.clone(), &rec, 0.0, &stop, &stats);
+        });
+        let ev = rec.0.into_inner().unwrap();
+        let step = 0.0625;
+        let ons: Vec<(f64, u8, u8)> = ev.iter().filter(|e| e.1).map(|e| ((e.0 - t0) / step, e.3, e.4)).collect();
+        let expect = [(0.0, 36u8, 127u8), (0.0, 42, 100), (1.5, 42, 100), (2.0, 42, 100), (3.5, 42, 100), (8.0, 36, 100), (16.0, 36, 127), (16.0, 42, 100)];
+        assert_eq!(ons.len(), expect.len(), "{ons:?}");
+        for ((t, note, vel), (want_t, want_note, want_vel)) in ons.iter().zip(expect) {
+            assert!((t - want_t).abs() * step < 0.003, "{note} at {t} steps, wanted {want_t}: {ons:?}");
+            assert_eq!((*note, *vel), (want_note, want_vel), "at {t}: {ons:?}");
+        }
+        assert!(ev.iter().all(|e| e.2 == 9));
+        // a swung hit is released a step after it sounded (the one at 1.5 is
+        // cut short by the hat on step 2; the one at 3.5 rings its step)
+        let offs: Vec<f64> = ev.iter().filter(|e| !e.1 && e.3 == 42).map(|e| (e.0 - t0) / step).collect();
+        assert!(offs.iter().any(|t| (t - 4.5).abs() * step < 0.004), "{offs:?}");
+        assert!(offs.iter().any(|t| (t - 2.0).abs() * step < 0.004), "{offs:?}");
+        // soloing the kick silences the hat
+        let mut st2 = st.clone();
+        st2.apply(A::DrumArm(DrumArm::Solo));
+        st2.apply(A::DrumPad(0, None));
+        let snap = st2.snapshot();
+        assert!(snap.drums.audible(0) && !snap.drums.audible(4) && !snap.drums.audible(1));
+    }
+
+    #[test]
+    fn a_pad_tap_plays_at_once_with_the_clock_stopped() {
+        let st = SeqState::default();
+        let cur = std::sync::Mutex::new(std::sync::Arc::new(st.snapshot()));
+        let grid = Grid::default();
+        let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+        let stop = AtomicBool::new(false);
+        let stats = SeqStats::default();
+        let t0 = now();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sleep_until(t0 + 0.05);
+                let mut s2 = st.clone();
+                s2.apply(SeqAction::DrumPad(2, None));
+                *cur.lock().unwrap() = std::sync::Arc::new(s2.snapshot());
+                sleep_until(t0 + 0.1);
+                // another edit republishes the same tap: it does not play again
+                s2.apply(SeqAction::DrumStep(3));
+                *cur.lock().unwrap() = std::sync::Arc::new(s2.snapshot());
+                sleep_until(t0 + 0.3);
+                stop.store(true, Ordering::Relaxed);
+            });
+            run(|| grid, || cur.lock().unwrap().clone(), &rec, 0.0, &stop, &stats);
+        });
+        let ev = rec.0.into_inner().unwrap();
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        let (t_on, on, ch, note, vel) = ev[0];
+        assert!(on && ch == 9 && note == 37 && vel == 100);
+        assert!(t_on - (t0 + 0.05) < 0.01, "late by {}", t_on - t0 - 0.05);
+        assert!(!ev[1].1 && (ev[1].0 - t_on - 0.1).abs() < 0.01, "{ev:?}");
+    }
+
+    #[test]
     fn playhead_and_step_positions() {
         let g = Grid { running: true, t0: 10.0, n0: 4, period: 0.5, downbeat: 0, bar_len: 4, ..Grid::default() };
         assert_eq!(playhead(&g, 10.0), Some(0));
@@ -1434,5 +2140,13 @@ mod tests {
         assert_eq!(phrase_playhead(&g, 12.0, 2), Some((0, 0)));
         assert_eq!(phrase_playhead(&g, 14.1, 2), Some((1, 0)));
         assert_eq!(phrase_playhead(&g, 14.1, 4), Some((3, 0)));
+        // the nearest 16th for recording, and whether it is still to come
+        let near = |t: f64| phrase_nearest(&g, t, 2).unwrap();
+        assert_eq!(near(10.0), RecPos { bar: 1, step: 0, ahead: false });
+        assert_eq!(near(10.10), RecPos { bar: 1, step: 1, ahead: true });
+        assert_eq!(near(10.15), RecPos { bar: 1, step: 1, ahead: false });
+        assert_eq!(near(9.95), RecPos { bar: 1, step: 0, ahead: true });
+        assert_eq!(near(9.9), RecPos { bar: 0, step: 15, ahead: false });
+        assert_eq!(phrase_nearest(&Grid::default(), 10.0, 2), None);
     }
 }

@@ -95,11 +95,11 @@ is drawn into a buffer and written to `/dev/fb0`, touches are read from
 when something visible changes (measured: under 1 % of a core, even on a 4K
 framebuffer; the real-time threads do not see it).
 
-Three tabs share the top bar. The clock state and the input level meter are
+Five tabs share the top bar. The clock state and the input level meter are
 shown on the TEMPO tab only; the other tabs show just the tempo:
 
 ```
- [TEMPO] [SEQUENCE] [BASS]    RUNNING      IN ████░░░
+ [TEMPO] [LEAD] [BASS] [DRUMS] [SETUP]   RUNNING   IN ████░░░
  [ AUTO ]
  [MANUAL]        120.0 BPM
             TEMPO STRENGTH 0.41       CONF ██████░░
@@ -127,15 +127,15 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
 - Touch latency is subtracted from tap times (`tap_offset_ms`); if your taps
   consistently land the click late, raise it.
 
-### Sequencer (SEQUENCE tab)
+### Lead sequencer (LEAD tab)
 
 ```
- [TEMPO] [SEQUENCE] [BASS]            120.0
+ [TEMPO] [LEAD] [BASS] [DRUMS] [SETUP]           120.0
  LEN [1] [2] [4] [8]   BAR [1] [2] [3] [4] [5] [6] [7] [8] [🔒]
   C1  ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □      8 tracks x 16 steps of the shown bar
   D1  □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □      playhead column highlighted
   ...
- [-] CH 10 [+]        [-] NOTE C1 [+]        [-] VEL 100 [+]
+ [-] NOTE C1 [+]                [-] VEL 100 [+]
 ```
 
 - Steps are 16ths of the bar; step 1 is the downbeat of the live grid, so the
@@ -152,7 +152,9 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   button toggles between following the clock and holding the shown bar.
 - Tap a cell to set or clear a step with the track's note and velocity. Tap
   the note name on the left to select a track; `-`/`+` (hold to repeat)
-  change its MIDI channel, note and velocity.
+  change its note and velocity. The eight tracks are polyphonic voices of
+  one instrument: they all play on the lead's MIDI channel, which is set
+  on the SETUP tab.
 - **Longer notes**: put the finger down on the step and drag to the right;
   the note lasts up to the step you let go on. Its steps are drawn joined,
   the head in the track colour, the rest darker. Hold the finger at the
@@ -169,7 +171,8 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   (`A`-`D`), but the screen has no buttons for them yet; pattern A is used.
 - Default tracks are General MIDI drums on channel 10 (kick, snare, hats,
   clap, toms, crash). Patterns are saved to `sequencer.file` a second after
-  the last edit and loaded at start.
+  the last edit and loaded at start (a file from when every track had its
+  own channel loads with the first track's channel as the lead's).
 - Notes go out on the same rawmidi port as the clock, from their own
   SCHED_FIFO thread (`sequencer_priority`), scheduled from the grid with
   `midi.lead_ms` (+ `sequencer.lead_ms`) lead. Note-offs sit on the grid at
@@ -180,13 +183,13 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   `--mode manual` runs a fixed clock at `manual_bpm`. `--no-ui` disables it.
   No interface? `--no-audio` (or `audio.enabled = false`) runs UI and MIDI only.
 - `midi-clock --ui-snapshot shot.ppm --ui-size 800x480` renders the layout
-  off-screen for any display size (writes the tempo, manual, sequence and
-  bass pages).
+  off-screen for any display size (writes the tempo, manual, lead,
+  bass, drums and setup pages).
 
 ### Bass line (BASS tab)
 
 ```
- [TEMPO] [SEQUENCE] [BASS]            120.0
+ [TEMPO] [LEAD] [BASS] [DRUMS] [SETUP]           120.0
  LEN [1] [2] [4] [8]   BAR [1] [2] [3] [4] [5] [6] [7] [8] [🔒]
  [▲] G1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   eight semitones, 16 steps of the shown bar
      ...                                    lowest note at the bottom
@@ -197,9 +200,9 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
 - A single voice: each step holds one note or nothing, and a new note always
   ends the one before it. Tap a cell to put that note on the step; tap it
   again to clear the step; tapping another row moves the note. Drag to the
-  right for a longer note, exactly as on the SEQUENCE tab, bar edges
+  right for a longer note, exactly as on the LEAD tab, bar edges
   included; a long note rings until the next note at the latest.
-- **LEN**, **BAR** and the padlock work as on the SEQUENCE tab; the bass
+- **LEN**, **BAR** and the padlock work as on the LEAD tab; the bass
   phrase has its own length and its own lock, so a 2-bar drum pattern can run
   under an 8-bar bass line.
 - The grid shows eight semitones. Drag up or down anywhere on the grid (or
@@ -209,6 +212,65 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
   marked by a thin bar at the top or bottom edge of its step.
   **CH** and **VEL** are the MIDI channel and velocity.
 - The bass line is saved in `sequencer.file` with the drum patterns.
+
+### Drum kit (DRUMS tab)
+
+A second drum sequencer, worked the way a DrumBrute is: you pick an
+instrument on its pad and the 16 step buttons underneath are that
+instrument's steps; the pads play when you hit them; steps can be
+accented; the kit has swing.
+
+```
+ [TEMPO] [LEAD] [BASS] [DRUMS] [SETUP]           120.0
+ LEN [1] [2] [4] [8]   BAR [1] [2] [3] [4] [5] [6] [7] [8] [🔒]
+ [  KICK  ] [ SNARE ] [  RIM  ] [ CLAP  ] [ CHAT  ]   ten pads, each with a row of
+ [·········] [·········] ...                          dots: its steps in the shown bar
+ [  OHAT  ] [ LTOM  ] [ HTOM  ] [ CRASH ] [ RIDE  ]
+ [·········] ...
+  [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [16]   the selected pad's steps
+ [-] CH 10 [+]   [-] NOTE C1 [+]   [-] VEL 100 [+]   [-] SWING 50 [+]
+```
+
+- **Pads**: tap a pad to select the instrument (outlined in its colour) and
+  hear it at once, clock running or not. The pad shows the General MIDI
+  name of its note (KICK, SNARE, CHAT, ...; the note name for anything
+  else) and lights while its step plays. The kit sits on one MIDI channel
+  (**CH**); **NOTE** and **VEL** are the selected instrument's note and
+  velocity, so the kit can drive any drum machine or sampler.
+- **Steps**: the row of 16 is the selected instrument in the shown bar.
+  A tap cycles a step off → hit (dim) → accented hit (bright, velocity
+  127) → off, like the LEDs on the machine. The playhead step is white.
+  The row of dots on every pad is the same information for all
+  instruments at once, so the whole pattern stays in view.
+- The kit's state also has per-instrument mute and solo, clearing an
+  instrument, and live recording of pad taps onto the nearest 16th, but the
+  screen has no buttons for them.
+- **SWING** delays every second 16th of the kit: 50 is straight, 67 the
+  triplet feel, 75 half a step late (the DrumBrute range). It applies to
+  the drum kit only, not to the LEAD or BASS phrases, and the swung
+  hits follow tempo corrections like everything else.
+- **LEN**, **BAR** and the padlock work as on the other tabs, with the
+  kit's own phrase length and lock. Hits are one 16th long (no note
+  lengths, as on the machine); the kit is saved in `sequencer.file` with
+  the patterns and the bass line.
+
+### MIDI channels (SETUP tab)
+
+```
+ [TEMPO] [LEAD] [BASS] [DRUMS] [SETUP]           120.0
+ LEAD    [-]      CH 10      [+]
+ BASS    [-]      CH 1       [+]
+ DRUMS   [-]      CH 10      [+]
+```
+
+- Every instrument the sequencer plays with its MIDI channel: the lead
+  (all eight tracks together), the bass line and the drum kit. `-`/`+`
+  (hold to repeat) move the channel through 1..16; the change is heard at
+  once, a note already sounding is still released on the channel it
+  started on, and it is saved with the patterns.
+- The lead's channel is only set here; BASS and DRUMS also show theirs as
+  **CH** on their own tabs. The lead's channel belongs to the pattern, so
+  each of the four patterns can have its own.
 
 ### Working on the UI without the Pi
 

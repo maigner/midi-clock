@@ -1,7 +1,8 @@
-//! Layout, rendering and hit testing. Three pages share a top bar: TEMPO
-//! (the clock), SEQUENCE (the drum step sequencer) and BASS (the single-voice
-//! bass line). Everything is placed relative to the display size so 800x480
-//! and 1280x800 both work.
+//! Layout, rendering and hit testing. Five pages share a top bar: TEMPO
+//! (the clock), LEAD (the polyphonic step sequencer), BASS (the single-voice
+//! bass line), DRUMS (the pad-and-step-row drum kit) and SETUP (the MIDI
+//! channel of every instrument). Everything is placed relative to the
+//! display size so 800x480 and 1280x800 both work.
 
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -10,7 +11,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Arc, Circle, CornerRadii, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
-use sequencer::{cover_map, note_name, phrase_steps, BassParam, Param, SeqState, BASS_ROWS, BASS_TOP, STEPS, TRACKS};
+use sequencer::{cover_map, drum_name, note_name, phrase_steps, BassParam, DrumParam, Instrument, Param, SeqState, BASS_ROWS, BASS_TOP, DRUMS, STEPS, TRACKS};
 use tracker::{Grid, State};
 
 use crate::canvas::{Canvas, Scaled};
@@ -24,8 +25,10 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Tempo,
-    Sequence,
+    Lead,
     Bass,
+    Drums,
+    Settings,
 }
 
 /// Snapshot of everything the screen shows. Built by the application.
@@ -50,8 +53,10 @@ pub struct Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     PageTempo,
-    PageSequence,
+    PageLead,
     PageBass,
+    PageDrums,
+    PageSettings,
     ModeAuto,
     ModeManual,
     Minus5,
@@ -61,7 +66,7 @@ pub enum Button {
     Plus5,
     StartStop,
     Relock,
-    // Sequence page
+    // Lead page
     /// Phrase length in bars.
     Bars(u8),
     /// Bar shown for editing.
@@ -80,12 +85,26 @@ pub enum Button {
     BassPlus(BassParam),
     /// Scroll the pitch window by this many semitones (+1 = up).
     BassScroll(i32),
+    // Drums page
+    DrumBars(u8),
+    DrumBar(usize),
+    DrumBarLock,
+    DrumMinus(DrumParam),
+    DrumPlus(DrumParam),
+    /// Instrument pad: select and play.
+    DrumPad(usize),
+    /// One of the 16 steps of the selected instrument in the shown bar.
+    DrumStep(usize),
+    // Settings page
+    /// An instrument's MIDI channel, one down / one up.
+    ChannelMinus(Instrument),
+    ChannelPlus(Instrument),
 }
 
 impl Button {
     pub fn enabled(self, mode: Mode) -> bool {
         match self {
-            Button::PageTempo | Button::PageSequence | Button::PageBass | Button::ModeAuto | Button::ModeManual => true,
+            Button::PageTempo | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings | Button::ModeAuto | Button::ModeManual => true,
             Button::Relock => mode == Mode::Auto,
             Button::Minus5 | Button::Minus1 | Button::Tap | Button::Plus1 | Button::Plus5 | Button::StartStop => mode == Mode::Manual,
             _ => true,
@@ -104,12 +123,16 @@ impl Button {
                 | Button::BassMinus(_)
                 | Button::BassPlus(_)
                 | Button::BassScroll(_)
+                | Button::DrumMinus(_)
+                | Button::DrumPlus(_)
+                | Button::ChannelMinus(_)
+                | Button::ChannelPlus(_)
         )
     }
 
     fn page(self) -> Option<Page> {
         match self {
-            Button::PageTempo | Button::PageSequence | Button::PageBass => None,
+            Button::PageTempo | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => None,
             Button::ModeAuto
             | Button::ModeManual
             | Button::Minus5
@@ -119,10 +142,18 @@ impl Button {
             | Button::Plus5
             | Button::StartStop
             | Button::Relock => Some(Page::Tempo),
-            Button::Bars(_) | Button::Bar(_) | Button::BarLock | Button::ParamMinus(_) | Button::ParamPlus(_) => Some(Page::Sequence),
+            Button::Bars(_) | Button::Bar(_) | Button::BarLock | Button::ParamMinus(_) | Button::ParamPlus(_) => Some(Page::Lead),
             Button::BassBars(_) | Button::BassBar(_) | Button::BassBarLock | Button::BassMinus(_) | Button::BassPlus(_) | Button::BassScroll(_) => {
                 Some(Page::Bass)
             }
+            Button::DrumBars(_)
+            | Button::DrumBar(_)
+            | Button::DrumBarLock
+            | Button::DrumMinus(_)
+            | Button::DrumPlus(_)
+            | Button::DrumPad(_)
+            | Button::DrumStep(_) => Some(Page::Drums),
+            Button::ChannelMinus(_) | Button::ChannelPlus(_) => Some(Page::Settings),
         }
     }
 }
@@ -163,9 +194,34 @@ const TRACK_COLORS: [Rgb888; TRACKS] = [
     Rgb888::new(240, 120, 180),
     Rgb888::new(120, 200, 200),
 ];
-/// The -/+ parameter groups along the bottom of the sequence and bass pages.
-const SEQ_PARAMS: [Param; 3] = [Param::Channel, Param::Note, Param::Velocity];
+/// One colour per pad of the drum kit.
+const DRUM_COLORS: [Rgb888; DRUMS] = [
+    Rgb888::new(240, 150, 50),
+    Rgb888::new(230, 80, 70),
+    Rgb888::new(240, 120, 180),
+    Rgb888::new(230, 200, 60),
+    Rgb888::new(80, 200, 110),
+    Rgb888::new(120, 200, 200),
+    Rgb888::new(70, 190, 230),
+    Rgb888::new(110, 140, 240),
+    Rgb888::new(180, 120, 240),
+    Rgb888::new(205, 170, 130),
+];
+/// The -/+ parameter groups along the bottom of the sequence, bass and drums pages.
+const SEQ_PARAMS: [Param; 2] = [Param::Note, Param::Velocity];
 const BASS_PARAMS: [BassParam; 2] = [BassParam::Channel, BassParam::Velocity];
+const DRUM_PARAMS: [DrumParam; 4] = [DrumParam::Channel, DrumParam::Note, DrumParam::Velocity, DrumParam::Swing];
+/// Pads per row.
+const PAD_COLS: usize = DRUMS / 2;
+/// The page tabs of the top bar, with a short label for when the long ones
+/// do not fit the width.
+const TABS: [(Button, &str, &str); 5] = [
+    (Button::PageTempo, "TEMPO", "TEMPO"),
+    (Button::PageLead, "LEAD", "LEAD"),
+    (Button::PageBass, "BASS", "BASS"),
+    (Button::PageDrums, "DRUMS", "DRUMS"),
+    (Button::PageSettings, "SETUP", "SETUP"),
+];
 
 /// Width of one of `n` parameter groups across `w`, `m` apart and from the edges.
 fn param_group_w(w: i32, m: i32, n: usize) -> i32 {
@@ -191,7 +247,7 @@ fn note_cell(cell: Rectangle, gap: i32, corner: Size, join_l: bool, join_r: bool
     RoundedRectangle::new(r, CornerRadii { top_left: side(join_l), bottom_left: side(join_l), top_right: side(join_r), bottom_right: side(join_r) })
 }
 
-/// Sequence page content, extracted from the state so views compare cheaply.
+/// Lead page content, extracted from the state so views compare cheaply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeqView {
     /// A note starts on this step.
@@ -218,7 +274,7 @@ pub struct SeqView {
     edit: bool,
     playing: bool,
     pattern: usize,
-    params: [String; 3],
+    params: [String; 2],
 }
 
 impl SeqView {
@@ -277,7 +333,7 @@ impl SeqView {
             edit: st.edit,
             playing: st.playing,
             pattern: st.current,
-            params: [format!("CH {}", tr.channel + 1), note, vel],
+            params: [note, vel],
         }
     }
 }
@@ -338,6 +394,102 @@ impl BassView {
     }
 }
 
+/// Drums page content: the selected instrument's step row for the shown
+/// bar, and every pad's state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrumView {
+    /// The selected instrument's steps in the shown bar: 0 off, 1 hit, 2 accent.
+    steps: [u8; STEPS],
+    /// Every instrument's steps in the shown bar, for the dots on the pads.
+    dots: [[u8; STEPS]; DRUMS],
+    labels: [String; DRUMS],
+    muted: [bool; DRUMS],
+    solo: [bool; DRUMS],
+    /// The instrument hits on the 16th the clock is on: its pad lights.
+    lit: [bool; DRUMS],
+    drum: usize,
+    bars: u8,
+    /// Bar on screen: the one picked when locked, else the one playing.
+    bar: usize,
+    locked: bool,
+    /// Bar and step the clock is on within the phrase.
+    play: Option<(usize, usize)>,
+    params: [String; 4],
+}
+
+impl DrumView {
+    fn build(s: &Status) -> DrumView {
+        let st = &s.seq;
+        let d = &st.drums;
+        let bars = d.bars.max(1);
+        let play = sequencer::phrase_playhead(&s.live, s.now, bars as usize);
+        let bar = shown_bar(st.drum_shown_bar(), st.drum_bar_lock, play);
+        let sel = st.drum.min(DRUMS - 1);
+        let code = |st: sequencer::DrumStep| if !st.on { 0 } else if st.accent { 2 } else { 1 };
+        let mut dots = [[0u8; STEPS]; DRUMS];
+        let mut labels: [String; DRUMS] = Default::default();
+        let mut muted = [false; DRUMS];
+        let mut solo = [false; DRUMS];
+        let mut lit = [false; DRUMS];
+        for (i, dr) in d.drums.iter().enumerate().take(DRUMS) {
+            for (k, dot) in dots[i].iter_mut().enumerate() {
+                *dot = dr.steps.get(bar * STEPS + k).map_or(0, |st| code(*st));
+            }
+            labels[i] = drum_name(dr.note);
+            muted[i] = dr.muted;
+            solo[i] = dr.solo;
+            lit[i] = play.is_some_and(|(b, k)| dr.steps.get(b * STEPS + k).is_some_and(|st| st.on)) && d.audible(i);
+        }
+        let dr = &d.drums[sel];
+        DrumView {
+            steps: dots[sel],
+            dots,
+            labels,
+            muted,
+            solo,
+            lit,
+            drum: sel,
+            bars,
+            bar,
+            locked: st.drum_bar_lock,
+            play,
+            params: [format!("CH {}", d.channel + 1), format!("NOTE {}", note_name(dr.note)), format!("VEL {}", dr.vel), format!("SWING {}", d.swing)],
+        }
+    }
+}
+
+/// Settings page content: every instrument's name and MIDI channel, in the
+/// order of `Instrument::all()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsView {
+    rows: Vec<SettingsRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsRow {
+    /// "LEAD", "BASS", "DRUMS".
+    name: &'static str,
+    /// "CH 10".
+    value: String,
+    color: Rgb888,
+}
+
+impl SettingsView {
+    fn build(s: &Status) -> SettingsView {
+        let rows = Instrument::all()
+            .map(|inst| {
+                let (name, color) = match inst {
+                    Instrument::Lead => ("LEAD", TEXT),
+                    Instrument::Bass => ("BASS", BASS),
+                    Instrument::Drums => ("DRUMS", TEXT),
+                };
+                SettingsRow { name, value: format!("CH {}", s.seq.channel(inst) + 1), color }
+            })
+            .collect();
+        SettingsView { rows }
+    }
+}
+
 /// The bar to put on screen: the picked one while locked (or while the clock
 /// is stopped), otherwise the bar being played.
 fn shown_bar(picked: usize, locked: bool, play: Option<(usize, usize)>) -> usize {
@@ -367,6 +519,8 @@ pub struct View {
     pressed: Option<Button>,
     seq: Option<SeqView>,
     bass: Option<BassView>,
+    drums: Option<DrumView>,
+    settings: Option<SettingsView>,
     /// Where the finger is, drawn as a marker (calibration aid).
     pub touch: Option<(i32, i32)>,
 }
@@ -380,6 +534,11 @@ impl View {
     /// (bar on screen, playing bar) of the bass page, if built.
     pub fn bass_bars(&self) -> Option<(usize, Option<usize>)> {
         self.bass.as_ref().map(|q| (q.bar, q.play.map(|(b, _)| b)))
+    }
+
+    /// (bar on screen, playing bar) of the drums page, if built.
+    pub fn drum_bars(&self) -> Option<(usize, Option<usize>)> {
+        self.drums.as_ref().map(|q| (q.bar, q.play.map(|(b, _)| b)))
     }
 
     pub fn build(s: &Status, pressed: Option<Button>) -> View {
@@ -435,7 +594,7 @@ impl View {
             None
         };
         // The level meter is only drawn on the TEMPO page; freeze it elsewhere so
-        // a noisy mic does not force a redraw of the SEQUENCE page every frame.
+        // a noisy mic does not force a redraw of the LEAD page every frame.
         let level_pct = if page == Page::Tempo { (((s.level_db + 60.0) / 60.0 * 50.0).round().clamp(0.0, 50.0) as u32) * 2 } else { 0 };
         let (stats, stats_short) = if s.midi {
             (format!("MIDI {}k TICKS  LATE MAX {} US", s.ticks / 1000, s.late_max_us), format!("LATE {} US", s.late_max_us))
@@ -458,8 +617,10 @@ impl View {
             stats_short,
             running: live.running,
             pressed,
-            seq: (page == Page::Sequence).then(|| SeqView::build(s)),
+            seq: (page == Page::Lead).then(|| SeqView::build(s)),
             bass: (page == Page::Bass).then(|| BassView::build(s)),
+            drums: (page == Page::Drums).then(|| DrumView::build(s)),
+            settings: (page == Page::Settings).then(|| SettingsView::build(s)),
             touch,
         }
     }
@@ -471,6 +632,11 @@ pub struct Screen {
     m: i32,
     small: u32,
     big: u32,
+    /// Text scale of the clock state in the top bar (it has to fit between
+    /// the tabs and the level meter).
+    state_k: u32,
+    /// Width of the level meter in the top bar.
+    meter_w: i32,
     /// Left edge of the free space in the tempo page's bottom row.
     stats_x: i32,
     /// Horizontal centre of the tempo readout.
@@ -491,8 +657,15 @@ pub struct Screen {
     /// Bass page: the note names; dragging them (or the grid) up and down
     /// scrolls the pitch window.
     bass_labels: Rectangle,
-    /// The LEN / BAR captions of the phrase row (sequence and bass pages).
+    /// Drums page: width of one step button.
+    drum_step_w: i32,
+    /// The LEN / BAR captions of the phrase row (sequence, bass and drums pages).
     captions: [(Point, &'static str); 2],
+    /// The tab labels as they fit the width.
+    tab_labels: [&'static str; TABS.len()],
+    /// Settings page: the name and the channel readout of every instrument,
+    /// in the order of `Instrument::all()`.
+    setup_rows: Vec<(Rectangle, Rectangle)>,
 }
 
 impl Screen {
@@ -504,14 +677,29 @@ impl Screen {
         let rect = |x: i32, y: i32, bw: i32, bh: i32| Rectangle::new(Point::new(x, y), Size::new(bw.max(1) as u32, bh.max(1) as u32));
         // --- top bar: page tabs -------------------------------------------------
         let top_h = (h as f64 * 0.13) as i32;
-        let tab_w = (w as f64 * 0.14) as i32;
-        buttons.push((Button::PageTempo, rect(m, m, tab_w, top_h - m)));
-        buttons.push((Button::PageSequence, rect(2 * m + tab_w, m, tab_w, top_h - m)));
-        buttons.push((Button::PageBass, rect(3 * m + 2 * tab_w, m, tab_w, top_h - m)));
-        let tabs_end = 4 * m + 3 * tab_w;
-        // the level meter sits at the right, its "IN" caption left of it
-        let meter_x = w - m - (w as f64 * 0.18) as i32;
-        let state_cx = (tabs_end + meter_x - m - 20 * small as i32) / 2;
+        // Each tab is as wide as its label. The level meter sits at the
+        // right of the bar, its "IN" caption left of it, and the clock state
+        // ("LISTENING" is the longest) between it and the tabs: the tabs
+        // take the largest text (two lines of the small font at most) that
+        // leaves the state its room, and short labels if even one line of
+        // the long ones does not.
+        let meter_w = (w as f64 * 0.12) as i32;
+        let meter_x = w - m - meter_w;
+        let state_end = meter_x - m - 20 * small as i32;
+        let tabs_w = |k: i32, long: bool| TABS.iter().map(|(_, l, s)| (if long { l } else { s }).len() as i32 * 10 * k + 3 * m).sum::<i32>() + m;
+        let fits = |k: i32, long: bool| tabs_w(k, long) + 9 * 10 <= state_end;
+        let (tab_k, long) = (1..=small.min(2) as i32).rev().map(|k| (k, true)).find(|&(k, l)| fits(k, l)).unwrap_or((1, false));
+        let tab_labels = TABS.map(|(_, l, s)| if long { l } else { s });
+        let mut x = m;
+        for ((b, _, _), label) in TABS.into_iter().zip(tab_labels) {
+            let tab_w = label.len() as i32 * 10 * tab_k + 2 * m;
+            buttons.push((b, rect(x, m, tab_w, top_h - m)));
+            x += tab_w + m;
+        }
+        let tabs_end = x;
+        let state_cx = (tabs_end + state_end) / 2;
+        let state_avail = state_end - tabs_end;
+        let state_k = (1..=small).rev().find(|k| 9 * 10 * *k as i32 <= state_avail).unwrap_or(1);
         let top_bpm_cx = (tabs_end + w) / 2;
         // --- tempo page ----------------------------------------------------------------
         let mode_w = (w as f64 * 0.17) as i32;
@@ -547,6 +735,7 @@ impl Screen {
             let r = rect(x + i as i32 * (bu + m), by, bu, bh);
             buttons.push((Button::Bars(n), r));
             buttons.push((Button::BassBars(n), r));
+            buttons.push((Button::DrumBars(n), r));
         }
         x += 4 * (bu + m) + m + cap_w;
         let bar_cap = Point::new(x - m, by + bh / 2);
@@ -554,11 +743,13 @@ impl Screen {
             let r = rect(x + b as i32 * (bu + m), by, bu, bh);
             buttons.push((Button::Bar(b), r));
             buttons.push((Button::BassBar(b), r));
+            buttons.push((Button::DrumBar(b), r));
         }
         // and a padlock: hold the shown bar instead of following the clock
         let r = rect(x + sequencer::MAX_BARS as i32 * (bu + m), by, bu, bh);
         buttons.push((Button::BarLock, r));
         buttons.push((Button::BassBarLock, r));
+        buttons.push((Button::DrumBarLock, r));
         // Parameters along the bottom of both pages.
         let yp = (h as f64 * 0.86) as i32;
         let hp = h - m - yp;
@@ -608,12 +799,56 @@ impl Screen {
             buttons.push((Button::BassMinus(p), rect(gx, yp, pm_w3, hp)));
             buttons.push((Button::BassPlus(p), rect(gx + group_w3 - pm_w3, yp, pm_w3, hp)));
         }
+        // --- drums page ---------------------------------------------------------------
+        // As on a DrumBrute: the pads in the middle, the 16 step buttons of
+        // the selected instrument in one big row underneath.
+        let dy0 = by + bh + m;
+        let dy1 = (h as f64 * 0.84) as i32;
+        let step_h = ((dy1 - dy0) as f64 * 0.30) as i32;
+        let step_y = dy1 - step_h;
+        let drum_step_w = (w - 2 * m - gap * (STEPS as i32 - 1)) / STEPS as i32;
+        for k in 0..STEPS {
+            buttons.push((Button::DrumStep(k), rect(m + k as i32 * (drum_step_w + gap), step_y, drum_step_w, step_h)));
+        }
+        let pads_h = step_y - m - dy0;
+        let px = m;
+        let pad_w = (w - m - px - gap * (PAD_COLS as i32 - 1)) / PAD_COLS as i32;
+        let pad_h = (pads_h - gap) / 2;
+        for i in 0..DRUMS {
+            let (row, col) = ((i / PAD_COLS) as i32, (i % PAD_COLS) as i32);
+            buttons.push((Button::DrumPad(i), rect(px + col * (pad_w + gap), dy0 + row * (pad_h + gap), pad_w, pad_h)));
+        }
+        let group_w4 = param_group_w(w, m, DRUM_PARAMS.len());
+        let pm_w4 = group_w4 / 4;
+        for (i, p) in DRUM_PARAMS.into_iter().enumerate() {
+            let gx = m + i as i32 * (group_w4 + m);
+            buttons.push((Button::DrumMinus(p), rect(gx, yp, pm_w4, hp)));
+            buttons.push((Button::DrumPlus(p), rect(gx + group_w4 - pm_w4, yp, pm_w4, hp)));
+        }
+        // --- settings page -------------------------------------------------------------
+        // One row per instrument across the width: its name, then
+        // "[-] CH n [+]" with the readout taking what the buttons leave.
+        let setup_n = Instrument::all().count() as i32;
+        let row_h = ((h as f64 * 0.16) as i32).min((h - m - by - (setup_n - 1) * m) / setup_n);
+        let name_w = (w as f64 * 0.25) as i32;
+        let pm_w5 = (w as f64 * 0.15) as i32;
+        let value_w = w - 2 * m - name_w - m - 2 * pm_w5 - 2 * gap;
+        let mut setup_rows = Vec::new();
+        for (i, inst) in Instrument::all().enumerate() {
+            let y = by + i as i32 * (row_h + m);
+            let gx = m + name_w + m;
+            buttons.push((Button::ChannelMinus(inst), rect(gx, y, pm_w5, row_h)));
+            buttons.push((Button::ChannelPlus(inst), rect(gx + pm_w5 + gap + value_w + gap, y, pm_w5, row_h)));
+            setup_rows.push((rect(m, y, name_w, row_h), rect(gx + pm_w5 + gap, y, value_w, row_h)));
+        }
         Self {
             w,
             h,
             m,
             small,
             big,
+            state_k,
+            meter_w,
             stats_x,
             bpm_cx,
             state_cx,
@@ -627,7 +862,10 @@ impl Screen {
             bass_cell_w,
             bass_cell_h,
             bass_labels,
+            drum_step_w,
             captions: [(len_cap, "LEN"), (bar_cap, "BAR")],
+            tab_labels,
+            setup_rows,
         }
     }
 
@@ -669,7 +907,7 @@ impl Screen {
         if let Some((b, _)) = self.buttons.iter().find(|(b, r)| b.page().map_or(true, |bp| bp == page) && r.contains(p)) {
             return Some(Hit::Button(*b));
         }
-        if page == Page::Sequence {
+        if page == Page::Lead {
             if let Some(t) = self.tracks.iter().position(|r| r.contains(p)) {
                 return Some(Hit::Track(t));
             }
@@ -752,18 +990,27 @@ impl Screen {
             if b.page().map_or(false, |p| p != v.page) {
                 continue;
             }
+            // pads and steps are drawn by `render_drums`
+            if matches!(b, Button::DrumPad(_) | Button::DrumStep(_)) {
+                continue;
+            }
             let bass = v.bass.as_ref();
             let seq = v.seq.as_ref();
+            let drums = v.drums.as_ref();
+            let drum_col = drums.map(|q| DRUM_COLORS[q.drum]);
             // bars beyond the phrase length cannot be selected
             let enabled = b.enabled(v.mode)
                 && !matches!(b, Button::BassBar(i) if bass.map_or(false, |q| *i >= q.bars as usize))
                 && !matches!(b, Button::Bar(i) if seq.map_or(false, |q| *i >= q.bars as usize))
+                && !matches!(b, Button::DrumBar(i) if drums.map_or(false, |q| *i >= q.bars as usize))
                 && !matches!(b, Button::BassScroll(d) if bass.map_or(false, |q| (*d > 0 && q.base >= BASS_TOP) || (*d < 0 && q.base == 0)));
             let pressed = v.pressed == Some(*b);
             let (label, accent): (String, Option<Rgb888>) = match b {
-                Button::PageTempo => ("TEMPO".into(), (v.page == Page::Tempo).then_some(TEXT)),
-                Button::PageSequence => ("SEQUENCE".into(), (v.page == Page::Sequence).then_some(TEXT)),
-                Button::PageBass => ("BASS".into(), (v.page == Page::Bass).then_some(TEXT)),
+                Button::PageTempo => (self.tab_labels[0].into(), (v.page == Page::Tempo).then_some(TEXT)),
+                Button::PageLead => (self.tab_labels[1].into(), (v.page == Page::Lead).then_some(TEXT)),
+                Button::PageBass => (self.tab_labels[2].into(), (v.page == Page::Bass).then_some(TEXT)),
+                Button::PageDrums => (self.tab_labels[3].into(), (v.page == Page::Drums).then_some(TEXT)),
+                Button::PageSettings => (self.tab_labels[4].into(), (v.page == Page::Settings).then_some(TEXT)),
                 Button::ModeAuto => ("AUTO".into(), (v.mode == Mode::Auto).then_some(AUTO)),
                 Button::ModeManual => ("MANUAL".into(), (v.mode == Mode::Manual).then_some(MANUAL)),
                 Button::Minus5 => ("-5".into(), None),
@@ -773,8 +1020,8 @@ impl Screen {
                 Button::Plus5 => ("+5".into(), None),
                 Button::StartStop => (if v.running { "STOP" } else { "START" }.into(), None),
                 Button::Relock => ("RELOCK".into(), None),
-                Button::ParamMinus(_) | Button::BassMinus(_) => ("-".into(), None),
-                Button::ParamPlus(_) | Button::BassPlus(_) => ("+".into(), None),
+                Button::ParamMinus(_) | Button::BassMinus(_) | Button::DrumMinus(_) | Button::ChannelMinus(_) => ("-".into(), None),
+                Button::ParamPlus(_) | Button::BassPlus(_) | Button::DrumPlus(_) | Button::ChannelPlus(_) => ("+".into(), None),
                 Button::BassScroll(_) => (String::new(), None),
                 Button::BarLock => (String::new(), seq.filter(|q| q.locked).map(|q| TRACK_COLORS[q.track])),
                 Button::BassBarLock => (String::new(), bass.map_or(false, |q| q.locked).then_some(BASS)),
@@ -790,6 +1037,14 @@ impl Screen {
                     let playing = seq.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i));
                     ((i + 1).to_string(), shown.or(playing.then_some(GREEN)))
                 }
+                Button::DrumBarLock => (String::new(), drums.filter(|q| q.locked).and(drum_col)),
+                Button::DrumBars(n) => (n.to_string(), drums.filter(|q| q.bars == *n).and(drum_col)),
+                Button::DrumBar(i) => {
+                    let shown = drums.filter(|q| q.bar == *i).and(drum_col);
+                    let playing = drums.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i));
+                    ((i + 1).to_string(), shown.or(playing.then_some(GREEN)))
+                }
+                Button::DrumPad(_) | Button::DrumStep(_) => unreachable!(),
             };
             let fill = if !enabled {
                 PANEL_DISABLED
@@ -799,7 +1054,8 @@ impl Screen {
                 PANEL
             };
             let playing_bar = matches!(b, Button::BassBar(i) if bass.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i)))
-                || matches!(b, Button::Bar(i) if seq.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i)));
+                || matches!(b, Button::Bar(i) if seq.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i)))
+                || matches!(b, Button::DrumBar(i) if drums.map_or(false, |q| q.play.map_or(false, |(bar, _)| bar == *i)));
             let fg = if !enabled {
                 DIM
             } else if playing_bar {
@@ -811,19 +1067,20 @@ impl Screen {
             match b {
                 Button::BarLock => self.padlock(c, r, seq.map_or(false, |q| q.locked), accent.unwrap_or(fg)),
                 Button::BassBarLock => self.padlock(c, r, bass.map_or(false, |q| q.locked), accent.unwrap_or(fg)),
+                Button::DrumBarLock => self.padlock(c, r, drums.map_or(false, |q| q.locked), accent.unwrap_or(fg)),
                 _ => {}
             }
         }
         // --- top bar ----------------------------------------------------------
         // Tempo page: clock state in the middle, input level meter at the right.
-        // Sequence page: only the tempo (the state and the meter belong to the
+        // Other pages: only the tempo (the state and the meter belong to the
         // TEMPO tab); XRUNS stay visible everywhere because they are an error.
         let top_h = (h as f64 * 0.13) as i32;
         let cy = top_h / 2;
         match v.page {
             Page::Tempo => {
-                self.text(c, &v.state, Point::new(self.state_cx, cy), s, v.state_color, Alignment::Center);
-                let meter_w = (w as f64 * 0.18) as i32;
+                self.text(c, &v.state, Point::new(self.state_cx, cy), self.state_k, v.state_color, Alignment::Center);
+                let meter_w = self.meter_w;
                 let meter_h = (10 * s) as i32;
                 let meter_x = w - m - meter_w;
                 let _ = c.fill_solid(&Rectangle::new(Point::new(meter_x, cy - meter_h / 2), Size::new(meter_w as u32, meter_h as u32)), PANEL);
@@ -843,7 +1100,7 @@ impl Screen {
                     self.text(c, &format!("XRUNS {}", v.xruns), Point::new(meter_x - m - (30 * s) as i32, cy), s, RED, Alignment::Right);
                 }
             }
-            Page::Sequence | Page::Bass => {
+            Page::Lead | Page::Bass | Page::Drums | Page::Settings => {
                 let col = match v.mode {
                     Mode::Auto => AUTO,
                     Mode::Manual => MANUAL,
@@ -856,7 +1113,7 @@ impl Screen {
         }
         match v.page {
             Page::Tempo => self.render_tempo(c, v),
-            Page::Sequence => {
+            Page::Lead => {
                 if let Some(q) = &v.seq {
                     self.render_sequence(c, v, q);
                 }
@@ -864,6 +1121,16 @@ impl Screen {
             Page::Bass => {
                 if let Some(q) = &v.bass {
                     self.render_bass(c, q);
+                }
+            }
+            Page::Drums => {
+                if let Some(q) = &v.drums {
+                    self.render_drums(c, v, q);
+                }
+            }
+            Page::Settings => {
+                if let Some(q) = &v.settings {
+                    self.render_settings(c, q);
                 }
             }
         }
@@ -1020,7 +1287,7 @@ impl Screen {
         for (i, label) in q.params.iter().enumerate() {
             let gx = m + i as i32 * (group_w + m);
             let r = Rectangle::new(Point::new(gx + group_w / 4 + gap, yp), Size::new((group_w / 2 - 2 * gap) as u32, hp as u32));
-            let accent = if q.edit && q.selected_step.is_some() && (i == 1 || i == 2) { YELLOW } else { TRACK_COLORS[q.track] };
+            let accent = if q.edit && q.selected_step.is_some() { YELLOW } else { TRACK_COLORS[q.track] };
             self.button(c, &r, label, PANEL_DISABLED, accent, None);
         }
         let _ = v;
@@ -1104,6 +1371,134 @@ impl Screen {
             self.button(c, &r, label, PANEL_DISABLED, BASS, None);
         }
     }
+
+    fn render_drums(&self, c: &mut Canvas, v: &View, q: &DrumView) {
+        let m = self.m;
+        let gap = (m / 2).max(2);
+        self.captions(c);
+        let playhead = q.play.filter(|(bar, _)| *bar == q.bar).map(|(_, k)| k);
+        let corner = Size::new(m as u32, m as u32);
+        for (b, r) in &self.buttons {
+            let pressed = v.pressed == Some(*b);
+            match b {
+                // --- step row: the selected instrument, as the LEDs of a
+                // DrumBrute: dim for a hit, bright for an accent -----------------
+                Button::DrumStep(k) => {
+                    let k = *k;
+                    let st = q.steps[k];
+                    let col = DRUM_COLORS[q.drum];
+                    let on_playhead = playhead == Some(k);
+                    let fill = if st > 0 {
+                        if q.muted[q.drum] {
+                            DIM
+                        } else if on_playhead {
+                            TEXT
+                        } else if st == 2 {
+                            col
+                        } else {
+                            dim(col)
+                        }
+                    } else if on_playhead || pressed {
+                        PANEL_PRESSED
+                    } else if k % 4 == 0 {
+                        PANEL_BEAT
+                    } else {
+                        PANEL
+                    };
+                    let _ = RoundedRectangle::with_equal_corners(*r, corner).into_styled(PrimitiveStyle::with_fill(fill)).draw(c);
+                    if self.drum_step_w >= 30 {
+                        let at = Point::new(r.top_left.x + gap + 1, r.top_left.y + gap + 5);
+                        self.text(c, &(k + 1).to_string(), at, 1, if st > 0 { BG } else { DIM }, Alignment::Left);
+                    }
+                }
+                // --- pads: name, and a dot per step of the shown bar ---------------
+                Button::DrumPad(i) => {
+                    let i = *i;
+                    let col = DRUM_COLORS[i];
+                    let fill = if q.muted[i] {
+                        PANEL_DISABLED
+                    } else if pressed || q.lit[i] {
+                        PANEL_PRESSED
+                    } else {
+                        PANEL
+                    };
+                    let fg = if q.muted[i] {
+                        DIM
+                    } else if q.solo[i] {
+                        GREEN
+                    } else {
+                        col
+                    };
+                    let rr = RoundedRectangle::with_equal_corners(*r, corner);
+                    let style = if q.drum == i {
+                        PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(col).stroke_width(3).build()
+                    } else {
+                        PrimitiveStyle::with_fill(fill)
+                    };
+                    let _ = rr.into_styled(style).draw(c);
+                    let (rw, rh) = (r.size.width as i32, r.size.height as i32);
+                    let label = &q.labels[i];
+                    let mut k = self.small;
+                    while k > 1 && (label.len() as i32) * 10 * k as i32 > rw - 2 * m {
+                        k -= 1;
+                    }
+                    // dots along the bottom edge, if the pad is wide enough
+                    let pitch = (rw - 2 * m) / STEPS as i32;
+                    let dot_h = if pitch >= 4 { (pitch - 2).min(rh / 6).max(2) } else { 0 };
+                    let text_cy = r.top_left.y + (rh - dot_h - m / 2) / 2;
+                    self.text(c, label, Point::new(r.center().x, text_cy), k, fg, Alignment::Center);
+                    if dot_h > 0 {
+                        let dot_y = r.top_left.y + rh - m - dot_h;
+                        let x0 = r.top_left.x + (rw - pitch * STEPS as i32) / 2;
+                        for s in 0..STEPS {
+                            let d = q.dots[i][s];
+                            let on_playhead = playhead == Some(s);
+                            let dc = if d > 0 {
+                                if q.muted[i] {
+                                    DIM
+                                } else if on_playhead {
+                                    TEXT
+                                } else if d == 2 {
+                                    col
+                                } else {
+                                    dim(col)
+                                }
+                            } else if on_playhead {
+                                PANEL_PRESSED
+                            } else {
+                                BG
+                            };
+                            let dr = Rectangle::new(Point::new(x0 + s as i32 * pitch + 1, dot_y), Size::new((pitch - 2).max(1) as u32, dot_h as u32));
+                            let _ = c.fill_solid(&dr, dc);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // --- parameter labels between their -/+ buttons ---------------------
+        let yp = (self.h as f64 * 0.86) as i32;
+        let hp = self.h - m - yp;
+        let group_w = param_group_w(self.w, m, DRUM_PARAMS.len());
+        for (i, label) in q.params.iter().enumerate() {
+            let gx = m + i as i32 * (group_w + m);
+            let r = Rectangle::new(Point::new(gx + group_w / 4 + gap, yp), Size::new((group_w / 2 - 2 * gap) as u32, hp as u32));
+            self.button(c, &r, label, PANEL_DISABLED, DRUM_COLORS[q.drum], None);
+        }
+    }
+
+    fn render_settings(&self, c: &mut Canvas, q: &SettingsView) {
+        // The -/+ buttons are drawn with the other buttons; here the name of
+        // each instrument and its channel between them, in the instrument's
+        // colour as the parameter readouts of the other pages.
+        let k = self.small;
+        for ((name_r, value_r), row) in self.setup_rows.iter().zip(&q.rows) {
+            self.text(c, row.name, Point::new(name_r.top_left.x + self.m / 2, name_r.center().y), k, row.color, Alignment::Left);
+            let rr = RoundedRectangle::with_equal_corners(*value_r, Size::new(self.m as u32, self.m as u32));
+            let _ = rr.into_styled(PrimitiveStyle::with_fill(PANEL_DISABLED)).draw(c);
+            self.text(c, &row.value, value_r.center(), k, row.color, Alignment::Center);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1142,7 +1537,7 @@ mod tests {
         for (w, h) in [(800usize, 480usize), (480, 320), (1024, 600), (1280, 800), (320, 240)] {
             let s = Screen::new(w, h);
             let bb = Rectangle::new(Point::zero(), Size::new(w as u32, h as u32));
-            for page in [Page::Tempo, Page::Sequence, Page::Bass] {
+            for page in [Page::Tempo, Page::Lead, Page::Bass, Page::Drums, Page::Settings] {
                 let on_page: Vec<_> = s.buttons.iter().filter(|(b, _)| b.page().map_or(true, |p| p == page)).collect();
                 for (i, (b, r)) in on_page.iter().enumerate() {
                     assert_eq!(r.intersection(&bb), *r, "{b:?} outside {w}x{h}");
@@ -1152,13 +1547,41 @@ mod tests {
                 }
             }
             assert_eq!(s.hit(w as i32 / 2, (h as f64 * 0.72) as i32, Page::Tempo), Some(Hit::Button(Button::Tap)));
+            // the five tabs in a row across the top, all inside the screen
+            let tabs: Vec<_> = TABS.iter().map(|(b, _, _)| s.buttons.iter().find(|(x, _)| x == b).unwrap().1).collect();
+            for (t1, t2) in tabs.iter().zip(&tabs[1..]) {
+                assert!(t2.top_left.x >= t1.top_left.x + t1.size.width as i32 && t2.top_left.y == t1.top_left.y);
+            }
+            assert!(tabs[4].top_left.x + (tabs[4].size.width as i32) <= w as i32 - s.m, "tabs run off the screen at {w}x{h}");
+            let tc = tabs[4].center();
+            assert_eq!(s.hit(tc.x, tc.y, Page::Drums), Some(Hit::Button(Button::PageSettings)));
+            // settings: one row per instrument, name, -, readout, + across the width
+            let at = |b: Button| s.buttons.iter().find(|(x, _)| *x == b).unwrap().1;
+            for (i, inst) in Instrument::all().enumerate() {
+                let (minus, plus) = (at(Button::ChannelMinus(inst)), at(Button::ChannelPlus(inst)));
+                let (name, value) = s.setup_rows[i];
+                assert!(name.top_left.x + (name.size.width as i32) <= minus.top_left.x && name.top_left.y == minus.top_left.y);
+                assert!(minus.top_left.x + (minus.size.width as i32) <= value.top_left.x);
+                assert!(value.top_left.x + (value.size.width as i32) <= plus.top_left.x);
+                assert_eq!(plus.top_left.x + (plus.size.width as i32), w as i32 - s.m, "{inst:?} row does not reach the right edge at {w}x{h}");
+                assert!(minus.size.height as i32 >= (h as i32) / 10, "{inst:?} channel buttons too flat at {w}x{h}");
+                assert!(5 * 10 * s.small as i32 <= name.size.width as i32 - s.m, "name does not fit at {w}x{h}");
+                assert!(5 * 10 * s.small as i32 <= value.size.width as i32, "readout does not fit at {w}x{h}");
+                if i > 0 {
+                    assert!(name.top_left.y >= s.setup_rows[i - 1].0.top_left.y + s.setup_rows[i - 1].0.size.height as i32);
+                }
+                let (mc, pc) = (minus.center(), plus.center());
+                assert_eq!(s.hit(mc.x, mc.y, Page::Settings), Some(Hit::Button(Button::ChannelMinus(inst))));
+                assert_eq!(s.hit(pc.x, pc.y, Page::Settings), Some(Hit::Button(Button::ChannelPlus(inst))));
+                assert!(!matches!(s.hit(pc.x, pc.y, Page::Lead), Some(Hit::Button(Button::ChannelPlus(_)))));
+            }
             // grid: the top-left cell and the bottom-right cell
             let g = s.grid;
-            assert_eq!(s.hit(g.top_left.x + 1, g.top_left.y + 1, Page::Sequence), Some(Hit::Cell(0, 0)));
+            assert_eq!(s.hit(g.top_left.x + 1, g.top_left.y + 1, Page::Lead), Some(Hit::Cell(0, 0)));
             let br = g.bottom_right().unwrap();
-            assert_eq!(s.hit(br.x - 1, br.y - 1, Page::Sequence), Some(Hit::Cell(TRACKS - 1, STEPS - 1)));
+            assert_eq!(s.hit(br.x - 1, br.y - 1, Page::Lead), Some(Hit::Cell(TRACKS - 1, STEPS - 1)));
             assert!(!matches!(s.hit(g.top_left.x + 1, g.top_left.y + 1, Page::Tempo), Some(Hit::Cell(..))));
-            assert!(matches!(s.hit(s.tracks[3].center().x, s.tracks[3].center().y, Page::Sequence), Some(Hit::Track(3))));
+            assert!(matches!(s.hit(s.tracks[3].center().x, s.tracks[3].center().y, Page::Lead), Some(Hit::Track(3))));
             // bass grid: the bottom row is the base note, the top row the 12th
             let g = s.bass_grid;
             assert_eq!(s.hit(g.top_left.x + 1, g.top_left.y + 1, Page::Bass), Some(Hit::BassCell(BASS_ROWS - 1, 0)));
@@ -1174,14 +1597,28 @@ mod tests {
             let (_, rl) = s.buttons.iter().find(|(b, _)| *b == Button::BarLock).unwrap();
             assert!(rl.top_left.x > r8.top_left.x && rl.top_left.y == r8.top_left.y, "padlock next to BAR 8 at {w}x{h}");
             let lc = rl.center();
-            assert_eq!(s.hit(lc.x, lc.y, Page::Sequence), Some(Hit::Button(Button::BarLock)));
+            assert_eq!(s.hit(lc.x, lc.y, Page::Lead), Some(Hit::Button(Button::BarLock)));
             assert_eq!(s.hit(lc.x, lc.y, Page::Bass), Some(Hit::Button(Button::BassBarLock)));
+            assert_eq!(s.hit(lc.x, lc.y, Page::Drums), Some(Hit::Button(Button::DrumBarLock)));
+            // drums: pads in two rows of five, the step row underneath them
+            let at = |b: Button| s.buttons.iter().find(|(x, _)| *x == b).unwrap().1;
+            let (p0, p5, p9) = (at(Button::DrumPad(0)), at(Button::DrumPad(5)), at(Button::DrumPad(9)));
+            assert_eq!(p0.top_left.x, p5.top_left.x);
+            assert!(p5.top_left.y > p0.top_left.y && p9.top_left.x > p5.top_left.x);
+            let st0 = at(Button::DrumStep(0));
+            assert!(st0.top_left.y > p9.top_left.y + p9.size.height as i32);
+            assert_eq!(s.hit(p0.center().x, p0.center().y, Page::Drums), Some(Hit::Button(Button::DrumPad(0))));
+            assert!(!matches!(s.hit(p0.center().x, p0.center().y, Page::Lead), Some(Hit::Button(Button::DrumPad(_)))));
+            let s15 = at(Button::DrumStep(15));
+            assert_eq!(s.hit(s15.center().x, s15.center().y, Page::Drums), Some(Hit::Button(Button::DrumStep(15))));
+            assert!(s15.top_left.x + (s15.size.width as i32) <= w as i32 - s.m);
+            assert_eq!(p0.top_left.x, s.m);
             assert!(!g.intersection(&bb).is_zero_sized() && g.intersection(&bb) == g, "bass grid outside {w}x{h}");
             for (b, r) in &s.buttons {
                 if b.page() == Some(Page::Bass) {
                     assert!(r.intersection(&g).is_zero_sized(), "{b:?} overlaps the bass grid at {w}x{h}");
                 }
-                if b.page() == Some(Page::Sequence) {
+                if b.page() == Some(Page::Lead) {
                     assert!(r.intersection(&s.grid).is_zero_sized(), "{b:?} overlaps the grid at {w}x{h}");
                 }
             }
@@ -1200,11 +1637,11 @@ mod tests {
         assert_ne!(a, View::build(&s2, None));
         assert_eq!(a.lamp, Some(2));
         // sequence page: the playhead moves every 16th
-        let b = View::build_with_touch(&s, Page::Sequence, None, None);
+        let b = View::build_with_touch(&s, Page::Lead, None, None);
         assert_eq!(b.seq.as_ref().unwrap().play, Some((0, 8)));
         let mut s3 = s.clone();
         s3.now += 0.13;
-        assert_ne!(b, View::build_with_touch(&s3, Page::Sequence, None, None));
+        assert_ne!(b, View::build_with_touch(&s3, Page::Lead, None, None));
         // bass page: the phrase position is (bar, step); the screen follows
         // the playing bar (bar 2 here) until a bar is picked
         let d = View::build_with_touch(&s, Page::Bass, None, None);
@@ -1229,7 +1666,7 @@ mod tests {
     #[test]
     fn long_notes_show_joined_and_continue_over_the_bar() {
         let s = status();
-        let v = View::build_with_touch(&s, Page::Sequence, None, None);
+        let v = View::build_with_touch(&s, Page::Lead, None, None);
         let q = v.seq.as_ref().unwrap();
         assert!(q.on[2][6] && !q.on[2][7]);
         assert_eq!(q.cover[2][6..10], [Some(6); 4]);
@@ -1262,7 +1699,7 @@ mod tests {
         let (w, h) = (800usize, 480usize);
         let screen = Screen::new(w, h);
         let mut ses = Session::new(&UiConfig::default(), Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, Rotation::R0));
-        ses.set_page(Page::Sequence);
+        ses.set_page(Page::Lead);
         let gap = (screen.m / 2).max(2);
         let cell = |t: usize, k: usize| {
             (screen.grid.top_left.x + k as i32 * (screen.cell_w + gap) + screen.cell_w / 2, screen.grid.top_left.y + t as i32 * (screen.cell_h + gap) + screen.cell_h / 2)
@@ -1329,9 +1766,109 @@ mod tests {
             s.render(&mut c, &View::build(&st, Some(Button::Tap)));
             st.mode = Mode::Manual;
             st.taps = 3;
-            s.render(&mut c, &View::build_with_touch(&st, Page::Sequence, Some(Button::ParamPlus(Param::Note)), Some((10, 10))));
+            s.render(&mut c, &View::build_with_touch(&st, Page::Lead, Some(Button::ParamPlus(Param::Note)), Some((10, 10))));
             assert!(c.bytes().iter().any(|&b| b > 100));
             s.render(&mut c, &View::build_with_touch(&st, Page::Bass, Some(Button::BassBar(1)), None));
+            s.render(&mut c, &View::build_with_touch(&st, Page::Drums, Some(Button::DrumPad(3)), None));
         }
+    }
+
+    #[test]
+    fn drums_view_shows_the_selected_pad_and_lights_playing_pads() {
+        use sequencer::SeqAction::*;
+        let s = status();
+        let mut seq = (*s.seq).clone();
+        seq.apply(DrumPad(4, None)); // closed hat
+        for k in [0, 2, 8] {
+            seq.apply(DrumStep(k));
+        }
+        seq.apply(DrumStep(8)); // accent
+        seq.apply(DrumPad(0, None));
+        seq.apply(DrumStep(0));
+        seq.apply(DrumArm(sequencer::DrumArm::Mute));
+        seq.apply(DrumPad(1, None));
+        seq.apply(DrumArm(sequencer::DrumArm::Mute));
+        let s = Status { seq: std::sync::Arc::new(seq), ..s };
+        // the clock is on step 8 of the (1-bar) phrase
+        let v = View::build_with_touch(&s, Page::Drums, None, None);
+        let q = v.drums.as_ref().unwrap();
+        assert_eq!(q.play, Some((0, 8)));
+        assert_eq!(v.drum_bars(), Some((0, Some(0))));
+        assert_eq!(q.drum, 0);
+        assert_eq!(q.steps[0], 1);
+        assert_eq!(q.dots[4][8], 2, "accented hat");
+        assert_eq!(q.dots[4][2], 1);
+        assert!(q.lit[4] && !q.lit[0], "the hat plays on step 8, the kick does not");
+        assert!(q.muted[1]);
+        assert_eq!(q.labels[0], "KICK");
+        assert_eq!(q.params[3], "SWING 50");
+        // a muted pad never lights
+        let mut seq = (*s.seq).clone();
+        seq.apply(DrumArm(sequencer::DrumArm::Mute));
+        seq.apply(DrumPad(4, None));
+        let s2 = Status { seq: std::sync::Arc::new(seq), ..s.clone() };
+        assert!(!View::build_with_touch(&s2, Page::Drums, None, None).drums.unwrap().lit[4]);
+        // the playhead moving on changes the view
+        let mut s3 = s.clone();
+        s3.now += 0.13;
+        assert_ne!(v, View::build_with_touch(&s3, Page::Drums, None, None));
+    }
+
+    #[test]
+    fn settings_view_lists_every_instrument_with_its_channel() {
+        let mut st = status();
+        let v = View::build_with_touch(&st, Page::Settings, None, None);
+        let q = v.settings.as_ref().unwrap();
+        assert_eq!(q.rows.len(), 3);
+        assert_eq!((q.rows[0].name, q.rows[0].value.as_str()), ("LEAD", "CH 10"));
+        assert_eq!((q.rows[1].name, q.rows[1].value.as_str()), ("BASS", "CH 1"));
+        assert_eq!((q.rows[2].name, q.rows[2].value.as_str()), ("DRUMS", "CH 10"));
+        // a channel change shows up, and only that changes the view
+        let mut seq = (*st.seq).clone();
+        seq.apply(sequencer::SeqAction::Channel(Instrument::Lead, 2));
+        st.seq = std::sync::Arc::new(seq);
+        let v2 = View::build_with_touch(&st, Page::Settings, None, None);
+        assert_ne!(v, v2);
+        assert_eq!(v2.settings.as_ref().unwrap().rows[0].value, "CH 12");
+        st.level_db = -3.0;
+        assert_eq!(View::build_with_touch(&st, Page::Settings, None, None), v2, "the level meter is not on this page");
+        // it renders, tabs included, at every size
+        for (w, h) in [(800usize, 480usize), (320, 240), (1280, 800)] {
+            let s = Screen::new(w, h);
+            let mut c = Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, Rotation::R0);
+            s.render(&mut c, &v2);
+        }
+    }
+
+    #[test]
+    fn a_pad_tap_carries_the_clock_position() {
+        use crate::{Action, Session, TouchEvent, UiConfig};
+        use sequencer::{RecPos, SeqAction::*};
+        let (w, h) = (800usize, 480usize);
+        let screen = Screen::new(w, h);
+        let mut ses = Session::new(&UiConfig::default(), Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, Rotation::R0));
+        ses.set_page(Page::Drums);
+        let at = |b: Button| screen.buttons.iter().find(|(x, _)| *x == b).unwrap().1.center();
+        let mut got = Vec::new();
+        // before the first frame the session knows no grid: the tap has no position
+        let p = at(Button::DrumPad(2));
+        ses.touch(TouchEvent::Down { x: p.x, y: p.y, t: 1.0 }, Mode::Auto, &mut |a| got.push(a));
+        ses.touch(TouchEvent::Up { t: 1.1 }, Mode::Auto, &mut |a| got.push(a));
+        assert_eq!(got, vec![Action::Seq(DrumPad(2, None))]);
+        // a frame brings the grid: the tap lands on the nearest 16th (the
+        // touch latency is subtracted, as for TAP)
+        let st = status();
+        ses.frame(st.now, &st, &mut |a| got.push(a));
+        got.clear();
+        let t = st.now + UiConfig::default().tap_offset_s;
+        ses.touch(TouchEvent::Down { x: p.x, y: p.y, t }, Mode::Auto, &mut |a| got.push(a));
+        ses.touch(TouchEvent::Up { t: t + 0.1 }, Mode::Auto, &mut |a| got.push(a));
+        assert_eq!(got, vec![Action::Seq(DrumPad(2, Some(RecPos { bar: 0, step: 8, ahead: false })))]);
+        // steps go through the usual dispatch
+        got.clear();
+        let p = at(Button::DrumStep(5));
+        ses.touch(TouchEvent::Down { x: p.x, y: p.y, t: 5.0 }, Mode::Auto, &mut |a| got.push(a));
+        ses.touch(TouchEvent::Up { t: 5.1 }, Mode::Auto, &mut |a| got.push(a));
+        assert_eq!(got, vec![Action::Seq(DrumStep(5))]);
     }
 }
