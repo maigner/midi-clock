@@ -488,7 +488,8 @@ pub struct Screen {
     bass_grid: Rectangle,
     bass_cell_w: i32,
     bass_cell_h: i32,
-    /// Bass page: the note names, a drag strip that scrolls the pitch window.
+    /// Bass page: the note names; dragging them (or the grid) up and down
+    /// scrolls the pitch window.
     bass_labels: Rectangle,
     /// The LEN / BAR captions of the phrase row (sequence and bass pages).
     captions: [(Point, &'static str); 2],
@@ -582,8 +583,8 @@ impl Screen {
             buttons.push((Button::ParamPlus(p), rect(gx + group_w - pm_w, yp, pm_w, hp)));
         }
         // --- bass page ---------------------------------------------------------------
-        // Pitch grid: twelve semitones, lowest note at the bottom, note names at
-        // the left, and left of those the up/down scroll buttons.
+        // Pitch grid: `BASS_ROWS` semitones, lowest note at the bottom, note
+        // names at the left, and left of those the up/down scroll buttons.
         let py0 = by + bh + m;
         let py1 = (h as f64 * 0.84) as i32;
         let bass_cell_h = (py1 - py0 - gap * (BASS_ROWS as i32 - 1)) / BASS_ROWS as i32;
@@ -633,6 +634,11 @@ impl Screen {
     /// Vertical distance between two bass rows: one semitone of drag scrolling.
     pub fn bass_row_pitch(&self) -> i32 {
         self.bass_cell_h + (self.m / 2).max(2)
+    }
+
+    /// Horizontal distance between two bass columns.
+    pub fn bass_col_pitch(&self) -> i32 {
+        self.bass_cell_w + (self.m / 2).max(2)
     }
 
     /// Column of the sequence (or bass) grid under `x`, clamped to the grid,
@@ -1292,6 +1298,26 @@ mod tests {
         ses.touch(TouchEvent::Move { x, y, t: 3.1 }, Mode::Auto, &mut act);
         ses.touch(TouchEvent::Up { t: 3.2 }, Mode::Auto, &mut act);
         assert_eq!(got, vec![Action::Seq(BassCellDown(4, 2)), Action::Seq(BassCellDrag(5)), Action::Seq(BassCellUp)]);
+        // a tap (finger lifted where it landed) sets the note
+        got.clear();
+        let mut act = |a: Action| got.push(a);
+        let (x, y) = bcell(3, 7);
+        ses.touch(TouchEvent::Down { x, y, t: 4.0 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Move { x: x + 2, y: y + 1, t: 4.05 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Up { t: 4.1 }, Mode::Auto, &mut act);
+        assert_eq!(got, vec![Action::Seq(BassSet(3, 7))]);
+        // dragging up and down on the grid scrolls the pitch window, one
+        // semitone per row of travel, and leaves the cell alone
+        got.clear();
+        let mut act = |a: Action| got.push(a);
+        let (x, y) = bcell(3, 7);
+        let pitch = screen.bass_row_pitch();
+        ses.touch(TouchEvent::Down { x, y, t: 5.0 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Move { x: x + 3, y: y + pitch / 2 + 1, t: 5.1 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Move { x: x + 3, y: y + 2 * pitch + 1, t: 5.2 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Move { x, y: y - pitch, t: 5.3 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Up { t: 5.4 }, Mode::Auto, &mut act);
+        assert_eq!(got, vec![Action::Seq(BassScroll(2)), Action::Seq(BassScroll(-3))]);
     }
 
     #[test]

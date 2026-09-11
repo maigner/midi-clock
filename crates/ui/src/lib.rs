@@ -73,11 +73,22 @@ pub struct Session {
     last_view: Option<View>,
     next_frame: f64,
     page: Page,
-    /// Finger dragging the bass note names: y at which the last semitone was
-    /// scrolled.
+    /// Finger scrolling the bass pitch window (note names or grid): y at
+    /// which the last semitone was scrolled.
     drag_y: Option<i32>,
     /// Finger dragging a note's length on the sequence or bass grid.
     cell_drag: Option<CellDrag>,
+    /// Finger down on a bass cell, direction not yet known: sideways it
+    /// becomes a note drag, up or down a scroll, lifted in place a tap.
+    pending: Option<PendingCell>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCell {
+    row: usize,
+    step: usize,
+    x: i32,
+    y: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +123,7 @@ impl Session {
             page: Page::Tempo,
             drag_y: None,
             cell_drag: None,
+            pending: None,
         }
     }
 
@@ -141,6 +153,7 @@ impl Session {
                 self.pressed = None;
                 self.drag_y = None;
                 self.cell_drag = None;
+                self.pending = None;
                 self.press_t = t;
                 self.last_repeat = t;
                 match self.screen.hit(lx, ly, self.page) {
@@ -158,10 +171,9 @@ impl Session {
                         self.cell_drag = Some(CellDrag { bass: false, col: step, edge: 0, edge_since: t });
                     }
                     Some(Hit::Track(track)) => act(Action::Seq(SeqAction::SelectTrack(track))),
-                    Some(Hit::BassCell(row, step)) => {
-                        act(Action::Seq(SeqAction::BassCellDown(row, step)));
-                        self.cell_drag = Some(CellDrag { bass: true, col: step, edge: 0, edge_since: t });
-                    }
+                    // The bass grid scrolls with an up/down drag, so the
+                    // note waits until the finger shows what it is doing.
+                    Some(Hit::BassCell(row, step)) => self.pending = Some(PendingCell { row, step, x: lx, y: ly }),
                     Some(Hit::BassLabels) => self.drag_y = Some(ly),
                     None => {}
                 }
@@ -174,8 +186,19 @@ impl Session {
                         self.pressed = None;
                     }
                 }
-                // Dragging the note names scrolls the pitch window with the
-                // finger: one row of travel is one semitone.
+                if let Some(pc) = self.pending {
+                    let (dx, dy) = ((lx - pc.x).abs(), (ly - pc.y).abs());
+                    if dx >= self.screen.bass_col_pitch() / 2 && dx >= dy {
+                        self.pending = None;
+                        act(Action::Seq(SeqAction::BassCellDown(pc.row, pc.step)));
+                        self.cell_drag = Some(CellDrag { bass: true, col: pc.step, edge: 0, edge_since: t });
+                    } else if dy >= self.screen.bass_row_pitch() / 2 {
+                        self.pending = None;
+                        self.drag_y = Some(pc.y);
+                    }
+                }
+                // Dragging the note names or the grid up and down scrolls the
+                // pitch window with the finger: one row of travel is one semitone.
                 if let Some(y0) = self.drag_y {
                     let pitch = self.screen.bass_row_pitch().max(1);
                     let rows = (ly - y0) / pitch;
@@ -203,6 +226,9 @@ impl Session {
                 self.pressed = None;
                 self.finger = None;
                 self.drag_y = None;
+                if let Some(pc) = self.pending.take() {
+                    act(Action::Seq(SeqAction::BassSet(pc.row, pc.step)));
+                }
                 if let Some(cd) = self.cell_drag.take() {
                     act(Action::Seq(if cd.bass { SeqAction::BassCellUp } else { SeqAction::CellUp }));
                 }
@@ -216,6 +242,7 @@ impl Session {
         self.finger = None;
         self.drag_y = None;
         self.cell_drag = None;
+        self.pending = None;
     }
 
     /// Auto-repeat for held +/- buttons, and a note drag held at the edge

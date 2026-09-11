@@ -24,7 +24,7 @@ pub const MAX_BARS: usize = 8;
 /// Steps a track or the bass line holds.
 pub const MAX_STEPS: usize = MAX_BARS * STEPS;
 /// Pitch rows the bass page shows at once (one octave).
-pub const BASS_ROWS: usize = 12;
+pub const BASS_ROWS: usize = 8;
 /// Highest `Bass::base`: the top row is then MIDI note 127.
 pub const BASS_TOP: u8 = 127 - (BASS_ROWS as u8 - 1);
 

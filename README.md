@@ -188,7 +188,7 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
 ```
  [TEMPO] [SEQUENCE] [BASS]            120.0
  LEN [1] [2] [4] [8]   BAR [1] [2] [3] [4] [5] [6] [7] [8] [🔒]
- [▲] B1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   twelve semitones, 16 steps of the shown bar
+ [▲] G1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   eight semitones, 16 steps of the shown bar
      ...                                    lowest note at the bottom
  [▼] C1  ■ □ □ ■ □ □ □ □ □ □ ■ □ □ □ □ □
  [-] CH 1 [+]                        [-] VEL 100 [+]
@@ -202,10 +202,11 @@ shown on the TEMPO tab only; the other tabs show just the tempo:
 - **LEN**, **BAR** and the padlock work as on the SEQUENCE tab; the bass
   phrase has its own length and its own lock, so a 2-bar drum pattern can run
   under an 8-bar bass line.
-- The grid shows twelve semitones. The **▲ ▼** buttons left of the note names
-  scroll the window one semitone at a time (hold to repeat), or drag the note
-  names up and down. Notes stay where they are; a note outside the shown
-  range is marked by a thin bar at the top or bottom edge of its step.
+- The grid shows eight semitones. Drag up or down anywhere on the grid (or
+  on the note names) to scroll the window with the finger; the **▲ ▼**
+  buttons left of the note names step it one semitone at a time (hold to
+  repeat). Notes stay where they are; a note outside the shown range is
+  marked by a thin bar at the top or bottom edge of its step.
   **CH** and **VEL** are the MIDI channel and velocity.
 - The bass line is saved in `sequencer.file` with the drum patterns.
 
