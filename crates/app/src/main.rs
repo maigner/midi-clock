@@ -81,11 +81,11 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
         level_db: -18.0,
         xruns: 0,
         ticks: 12345,
-        late_max_us: 82,
         midi: true,
         taps: 0,
         now,
         seq: Arc::new(SeqState::default()),
+        key: None,
     };
     std::fs::write(path, ui::snapshot(w, h, &st, Page::Tempo, None))?;
     let manual = path.with_extension("manual.ppm");
@@ -147,16 +147,36 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     std::fs::write(&drumsp, ui::snapshot(w, h, &st5, Page::Drums, None))?;
     let setupp = path.with_extension("setup.ppm");
     seq.apply(sequencer::SeqAction::Channel(sequencer::Instrument::Bass, 1)); // bass on channel 2
-    let st6 = ui::Status { seq: Arc::new(seq), ..st };
+    let st6 = ui::Status { seq: Arc::new(seq.clone()), ..st.clone() };
     std::fs::write(&setupp, ui::snapshot(w, h, &st6, Page::Settings, None))?;
+    // the key page: heard (A minor, sure, the band a little sharp) and by hand
+    let keyp = path.with_extension("key.ppm");
+    let mut chroma = [0.15f32; 12];
+    for (pc, c) in chroma.iter_mut().enumerate() {
+        if sequencer::Key::new(9, sequencer::Scale::Minor).contains(pc as u8) {
+            *c = 0.55;
+        }
+    }
+    chroma[9] = 1.0;
+    chroma[4] = 0.8;
+    let heard = key::KeyEstimate { tonic: 9, mode: key::Mode::Minor, confidence: 0.82, tuning_cents: 7.0, chroma, alt: Some((0, key::Mode::Major)), frames: 100 };
+    let st7 = ui::Status { key: Some(heard), ..st6.clone() };
+    std::fs::write(&keyp, ui::snapshot(w, h, &st7, Page::Key, None))?;
+    let keym = path.with_extension("key.manual.ppm");
+    seq.apply(sequencer::SeqAction::KeyRoot(2));
+    seq.apply(sequencer::SeqAction::KeyScale(sequencer::Scale::Dorian));
+    let st8 = ui::Status { seq: Arc::new(seq), ..st7 };
+    std::fs::write(&keym, ui::snapshot(w, h, &st8, Page::Key, None))?;
     eprintln!(
-        "wrote {}, {}, {}, {}, {} and {}",
+        "wrote {}, {}, {}, {}, {}, {}, {} and {}",
         path.display(),
         manual.display(),
         seqp.display(),
         bassp.display(),
         drumsp.display(),
-        setupp.display()
+        setupp.display(),
+        keyp.display(),
+        keym.display()
     );
     Ok(())
 }
@@ -180,6 +200,8 @@ struct Shared {
     onsets: AtomicU64,
     tempo_strength_milli: AtomicU32,
     audio_error: AtomicBool,
+    /// Samples the key detector's ring could not take (it fell behind).
+    key_overflow: AtomicU64,
 }
 
 fn main() -> Result<()> {
@@ -265,6 +287,11 @@ fn main() -> Result<()> {
     let rb = HeapRb::<HopMsg>::new(4096);
     let (mut prod, mut cons) = rb.split();
     let cpu = if cfg.realtime.cpu >= 0 { Some(cfg.realtime.cpu as usize) } else { None };
+    // The key detector's input: 4 s of the key channel, audio thread -> key thread.
+    let key_on = cfg.key.enabled && cfg.audio.enabled && !args.no_audio;
+    let krb = HeapRb::<f32>::new(if key_on { cfg.audio.sample_rate as usize * 4 } else { 16 });
+    let (mut kprod, mut kcons) = krb.split();
+    let key_est = Arc::new(arc_swap::ArcSwap::from_pointee(None::<key::KeyEstimate>));
 
     // --- MIDI clock thread -------------------------------------------------
     // --- Sequencer state and thread -------------------------------------------
@@ -340,10 +367,6 @@ fn main() -> Result<()> {
                 }
                 let mut tr = Tracker::new(tcfg);
                 while !shared.stop.load(Ordering::Relaxed) {
-                    if live.relock.swap(false, Ordering::Relaxed) {
-                        tr.relock();
-                        live.publish_tracker(tr.grid());
-                    }
                     if live.adopt.swap(false, Ordering::Relaxed) {
                         tr.adopt(**live.grid.load(), rtio::now());
                         live.publish_tracker(tr.grid());
@@ -369,6 +392,37 @@ fn main() -> Result<()> {
     let tracker_handle = tracker_thread.thread().clone();
     let tracker_handle_main = tracker_handle.clone();
 
+    // --- Key thread ---------------------------------------------------------
+    // Ordinary priority: a result that is right after a few seconds is all
+    // that matters. Publishes the detector's estimate whenever it changes.
+    let key_thread = key_on.then(|| {
+        let shared = shared.clone();
+        let est = key_est.clone();
+        let kcfg = cfg.key();
+        thread::Builder::new()
+            .name("key".into())
+            .spawn(move || {
+                let mut det = key::KeyDetector::new(kcfg);
+                let mut buf = vec![0f32; 4096];
+                while !shared.stop.load(Ordering::Relaxed) {
+                    loop {
+                        let n = kcons.pop_slice(&mut buf);
+                        if n == 0 {
+                            break;
+                        }
+                        det.process(&buf[..n], |_| {});
+                    }
+                    let e = det.estimate();
+                    if e != **est.load() {
+                        est.store(Arc::new(e));
+                    }
+                    thread::park_timeout(Duration::from_millis(50));
+                }
+            })
+            .expect("spawn key thread")
+    });
+    let key_handle = key_thread.as_ref().map(|t| t.thread().clone());
+
     // --- Audio thread ------------------------------------------------------
     let audio_thread = duplex.map(|mut duplex| {
         let live = live.clone();
@@ -377,6 +431,7 @@ fn main() -> Result<()> {
         let ccfg = cfg.click();
         let onset_offset = cfg.tempo.onset_offset_ms / 1000.0;
         let mic_channel = cfg.audio.mic_channel;
+        let key_channel = if cfg.audio.key_channel >= 0 { cfg.audio.key_channel as usize } else { mic_channel };
         let click_channels = cfg.audio.click_channels.clone();
         let click_enabled = cfg.click.enabled;
         let monitor_gain = cfg.audio.monitor_gain;
@@ -392,12 +447,14 @@ fn main() -> Result<()> {
                 let cap_ch = duplex.capture.channels();
                 let play_ch = duplex.playback.channels();
                 let mic = mic_channel % cap_ch;
+                let key_ch = key_channel % cap_ch;
                 let click_ch: Vec<usize> = click_channels.iter().map(|&c| c % play_ch).collect();
                 let mut det = onset::OnsetDetector::new(ocfg);
                 let hop_dt = det.hop_dt();
                 let mut synth = click::ClickSynth::new(ccfg);
                 let mut inbuf = vec![0f32; period * cap_ch];
                 let mut mono = vec![0f32; period];
+                let mut key_mono = vec![0f32; period];
                 let mut click_mono = vec![0f32; period];
                 let mut outbuf = vec![0f32; period * play_ch];
                 let mut total: u64 = 0;
@@ -424,6 +481,22 @@ fn main() -> Result<()> {
                     }
                     let db = 20.0 * (peak + 1e-9).log10();
                     shared.level_milli_db.store((-db * 1000.0).max(0.0) as u32, Ordering::Relaxed);
+                    // the key detector gets a copy of its channel; nothing else here
+                    if let Some(kh) = &key_handle {
+                        let src: &[f32] = if key_ch == mic {
+                            &mono
+                        } else {
+                            for (i, k) in key_mono.iter_mut().enumerate() {
+                                *k = inbuf[i * cap_ch + key_ch];
+                            }
+                            &key_mono
+                        };
+                        let pushed = kprod.push_slice(src);
+                        if pushed < src.len() {
+                            shared.key_overflow.fetch_add((src.len() - pushed) as u64, Ordering::Relaxed);
+                        }
+                        kh.unpark();
+                    }
                     let buf_end = total;
                     let mut pushed = false;
                     det.process(&mono, |h| {
@@ -482,6 +555,7 @@ fn main() -> Result<()> {
         let midi_on = cfg.midi.enabled && !args.no_midi;
         let seq_snapshot = seq_snapshot.clone();
         let seq_path = seq_path.clone();
+        let key_est = key_est.clone();
         Some(
             thread::Builder::new()
                 .name("ui".into())
@@ -512,11 +586,11 @@ fn main() -> Result<()> {
                             level_db: level,
                             xruns: shared.xruns.load(Ordering::Relaxed),
                             ticks: stats.ticks.load(Ordering::Relaxed),
-                            late_max_us: stats.late_max_us.load(Ordering::Relaxed),
                             midi: midi_on,
                             taps: manual.borrow().taps(),
                             now: rtio::now(),
                             seq: seq.borrow().clone(),
+                            key: **key_est.load(),
                         }
                     };
                     let act = |a: Action| {
@@ -547,7 +621,17 @@ fn main() -> Result<()> {
                                 manual.toggle(now);
                                 live.publish_manual(manual.grid());
                             }
-                            Action::Relock => live.relock.store(true, Ordering::Relaxed),
+                            Action::Generate(inst, style, seed) => {
+                                let heard = key_est.load_full();
+                                let k = ui::effective_key(&seq.borrow().key, (*heard).as_ref());
+                                if let Some(k) = k {
+                                    let mut arc = seq.borrow_mut();
+                                    if Arc::make_mut(&mut arc).apply(sequencer::SeqAction::Generate(inst, style, k, seed)) {
+                                        seq_snapshot.store(Arc::new(arc.snapshot()));
+                                        seq_dirty.set(Some(now));
+                                    }
+                                }
+                            }
                             Action::Seq(sa) => {
                                 let mut arc = seq.borrow_mut();
                                 if Arc::make_mut(&mut arc).apply(sa) && !sa.view_only() {
@@ -596,8 +680,13 @@ fn main() -> Result<()> {
             Mode::Manual => "manual",
         };
         let level = -(shared.level_milli_db.load(Ordering::Relaxed) as f32) / 1000.0;
+        let key_s = match **key_est.load() {
+            Some(e) if e.tuning_cents.abs() >= 5.0 => format!("{} {:.2} ({:+.0}c)", e.short_name(), e.confidence, e.tuning_cents),
+            Some(e) => format!("{} {:.2}", e.short_name(), e.confidence),
+            None => "--".to_string(),
+        };
         let line = format!(
-            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  in {level:5.1} dBFS  onsets {}  clicks {}  ticks {}  xruns {}",
+            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  in {level:5.1} dBFS  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
             g.bpm(),
             g.confidence,
             shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
@@ -618,6 +707,14 @@ fn main() -> Result<()> {
         let _ = t.join();
     }
     let _ = tracker_thread.join();
+    if let Some(t) = key_thread {
+        t.thread().unpark();
+        let _ = t.join();
+        let lost = shared.key_overflow.load(Ordering::Relaxed);
+        if lost > 0 {
+            eprintln!("key: {lost} samples dropped (detector fell behind)");
+        }
+    }
     if let Some(t) = ui_thread {
         let _ = t.join();
     }

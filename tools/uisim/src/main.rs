@@ -7,6 +7,8 @@
 //!
 //! Keys:  D  drummer on/off      [ ]  drummer tempo -/+ 2 BPM
 //!        J  toggle 15 ms timing jitter     Q / Esc  quit
+//!        K  cycle the key the (imaginary) band plays in: none, C major,
+//!           A minor, a doubtful G, a hopeless F# minor
 
 use std::time::Duration;
 
@@ -22,6 +24,31 @@ use rtio::MidiOut;
 use sequencer::{NoteOut, SeqState, SeqStats};
 use tracker::{Grid, HopInput, ManualClock, ManualConfig, Tracker, TrackerConfig};
 use ui::{Action, Canvas, Mode, PixelFormat, Rotation, Session, Status, TouchEvent, UiConfig};
+
+/// What the key detector would hear from a band: `K` steps through these.
+const HEARD_KEYS: [Option<(u8, key::Mode, f32)>; 5] = [None, Some((0, key::Mode::Major, 0.85)), Some((9, key::Mode::Minor, 0.7)), Some((7, key::Mode::Major, 0.45)), Some((6, key::Mode::Minor, 0.15))];
+
+fn heard(k: Option<(u8, key::Mode, f32)>) -> Option<key::KeyEstimate> {
+    let (tonic, mode, confidence) = k?;
+    let scale = match mode {
+        key::Mode::Major => sequencer::Scale::Major,
+        key::Mode::Minor => sequencer::Scale::Minor,
+    };
+    let key = sequencer::Key::new(tonic, scale);
+    let mut chroma = [0.15f32; 12];
+    for (pc, c) in chroma.iter_mut().enumerate() {
+        if key.contains(pc as u8) {
+            *c = 0.55;
+        }
+    }
+    chroma[tonic as usize] = 1.0;
+    chroma[((tonic + 7) % 12) as usize] = 0.8;
+    let alt = match mode {
+        key::Mode::Major if confidence < 0.6 => Some(((tonic + 9) % 12, key::Mode::Minor)),
+        _ => None,
+    };
+    Some(key::KeyEstimate { tonic, mode, confidence, tuning_cents: 7.0, chroma, alt, frames: 1 })
+}
 
 /// Notes go to the MIDI port if there is one, and to stderr if asked.
 struct SimNotes {
@@ -183,6 +210,8 @@ fn main() -> Result<()> {
     let mut mouse_down = false;
     let mut d_held = false;
     let mut j_held = false;
+    let mut k_held = false;
+    let mut heard_i = 0usize;
     let mut lb_held = false;
     let mut rb_held = false;
 
@@ -205,6 +234,14 @@ fn main() -> Result<()> {
             drummer.jitter = !drummer.jitter;
             eprintln!("jitter {}", drummer.jitter);
         }
+        if key_edge(&window, Key::K, &mut k_held) {
+            heard_i = (heard_i + 1) % HEARD_KEYS.len();
+            match heard(HEARD_KEYS[heard_i]) {
+                Some(e) => eprintln!("band plays in {} (confidence {:.2})", e.short_name(), e.confidence),
+                None => eprintln!("band plays nothing tonal"),
+            }
+        }
+        let heard_key = heard(HEARD_KEYS[heard_i]);
         if key_edge(&window, Key::LeftBracket, &mut lb_held) {
             drummer.bpm -= 2.0;
             eprintln!("drummer {:.0} bpm", drummer.bpm);
@@ -229,12 +266,12 @@ fn main() -> Result<()> {
             mouse_down = down;
             if let Some(ev) = ev {
                 let cur = mode;
-                let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+                let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, heard_key, now);
                 session.touch(ev, cur, &mut act);
             }
         }
         {
-            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, heard_key, now);
             session.tick(now, &mut act);
         }
         if mode == Mode::Auto {
@@ -260,11 +297,7 @@ fn main() -> Result<()> {
         // --- frame -------------------------------------------------------------------
         if session.frame_due(now) {
             let level = if drummer.playing { -14.0 + (drummer.rand() as f32) * 6.0 } else { -70.0 };
-            let (ticks, late_max_us) = if midi_out.is_some() {
-                (clock_stats.ticks.load(Ordering::Relaxed), clock_stats.late_max_us.load(Ordering::Relaxed))
-            } else {
-                (ticks, 82)
-            };
+            let ticks = if midi_out.is_some() { clock_stats.ticks.load(Ordering::Relaxed) } else { ticks };
             let st = Status {
                 mode,
                 live,
@@ -273,13 +306,13 @@ fn main() -> Result<()> {
                 level_db: level,
                 xruns: 0,
                 ticks,
-                late_max_us,
                 midi: true,
                 taps: manual.taps(),
                 now,
                 seq: seq.clone(),
+                key: heard_key,
             };
-            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, now);
+            let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, heard_key, now);
             if session.frame(now, &st, &mut act) {
                 for (p, b) in pixels.iter_mut().zip(session.canvas().bytes().chunks_exact(4)) {
                     *p = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -309,6 +342,7 @@ fn apply(
     seq: &mut Arc<SeqState>,
     seq_snapshot: &ArcSwap<sequencer::Snapshot>,
     seq_dirty: &mut Option<f64>,
+    heard: Option<key::KeyEstimate>,
     now: f64,
 ) {
     match a {
@@ -316,6 +350,14 @@ fn apply(
             if Arc::make_mut(seq).apply(sa) && !sa.view_only() {
                 seq_snapshot.store(Arc::new(seq.snapshot()));
                 *seq_dirty = Some(now);
+            }
+        }
+        Action::Generate(inst, style, seed) => {
+            if let Some(k) = ui::effective_key(&seq.key, heard.as_ref()) {
+                if Arc::make_mut(seq).apply(sequencer::SeqAction::Generate(inst, style, k, seed)) {
+                    seq_snapshot.store(Arc::new(seq.snapshot()));
+                    *seq_dirty = Some(now);
+                }
             }
         }
         Action::SetMode(Mode::Manual) => {
@@ -343,10 +385,6 @@ fn apply(
         Action::ToggleRun => {
             manual.toggle(now);
             *live = manual.grid();
-        }
-        Action::Relock => {
-            tracker.relock();
-            *live = tracker.grid();
         }
     }
 }

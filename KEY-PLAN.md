@@ -1,5 +1,16 @@
 # Key Detection from the Sound Input — Plan
 
+> **Status (2026-09-12):** phases 0–3 are implemented in `crates/key`, the
+> `[key]` config section, the key thread in `crates/app` and the **KEY** tab
+> (README, "Key"). Differences from the plan below: the readout got its own
+> tab with AUTO/MANUAL instead of a line on the TEMPO tab, and the manual
+> side sets a root and one of twelve scales; there is no RELOCK button any
+> more, so nothing resets the detector but silence; peaks must also be
+> within 50 dB of the frame's strongest and above -90 dBFS (window sidelobes
+> and the digital floor of quiet recordings were counted otherwise); the
+> `eval synth-tonal` / `eval key` tools and phase 4 (field recordings) are
+> still to do.
+
 Goal: while the band plays, the box also reports which key the music is in
 ("A minor", "F major"), with a confidence, so the screen can show it and the
 BASS sequencer can highlight the notes of that key. Same audio interface, no

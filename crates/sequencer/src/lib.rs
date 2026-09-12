@@ -12,11 +12,24 @@
 //! `SeqState` is the editable model (UI thread), `Snapshot` what the
 //! real-time thread plays, `run` the thread.
 
+pub mod generate;
+pub mod theory;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rtio::{now, sleep_until, MidiOut};
 use serde::{Deserialize, Serialize};
 use tracker::Grid;
+
+pub use generate::{GenNote, Rng, Style, Voice};
+pub use theory::{Key, KeySetup, Scale, PITCH_NAMES};
+
+/// Tonic of a generated LEAD line: the lowest of the eight track notes is
+/// the tonic at or above middle C (C3 here).
+pub const LEAD_GEN_LOW: u8 = 60;
+/// A generated bass line spans the octave up from the tonic at or above
+/// this note (G0), so the tonic lands between G0 and F#1.
+pub const BASS_GEN_LOW: u8 = 31;
 
 pub const STEPS: usize = 16;
 pub const TRACKS: usize = 8;
@@ -137,20 +150,30 @@ pub struct BassStep {
     /// Length in steps, as `Step::len`.
     #[serde(default = "one_step")]
     pub len: u16,
+    /// Files from before every bass note had its own velocity get the
+    /// default; a new note gets `Bass::vel`.
+    #[serde(default = "default_vel")]
+    pub vel: u8,
 }
 
 impl Default for BassStep {
     fn default() -> Self {
-        Self { on: false, note: 36, len: 1 }
+        Self { on: false, note: 36, len: 1, vel: default_vel() }
     }
 }
 
+fn default_vel() -> u8 {
+    100
+}
+
 /// The single-voice bass line: up to 8 bars of 16ths, one note per step,
-/// each with a length. A new note always ends the previous one (monophonic).
+/// each with a length and a velocity. A new note always ends the previous
+/// one (monophonic).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bass {
     /// MIDI channel, 0-based.
     pub channel: u8,
+    /// Velocity a new note gets.
     pub vel: u8,
     /// Phrase length in bars: 1, 2, 4 or 8.
     pub bars: u8,
@@ -172,6 +195,7 @@ impl Bass {
         for st in &mut self.steps {
             st.note &= 0x7F;
             st.len = st.len.clamp(1, MAX_STEPS as u16);
+            st.vel = st.vel.clamp(1, 127);
         }
         self.channel &= 0x0F;
         self.vel = self.vel.clamp(1, 127);
@@ -294,15 +318,13 @@ pub enum Param {
 /// Which bass parameter a +/- press changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BassParam {
-    Channel,
     Velocity,
 }
 
-/// Which drum kit parameter a +/- press changes: the kit's channel and
-/// swing, the selected instrument's note and velocity.
+/// Which drum kit parameter a +/- press changes: the kit's swing, the
+/// selected instrument's note and velocity. The channel is set on SETUP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrumParam {
-    Channel,
     Note,
     Velocity,
     Swing,
@@ -367,6 +389,10 @@ pub enum SeqAction {
     /// locked, and the note ends at the finger's column there. Past the end
     /// of the phrase the drag wraps to its first bar.
     CellDragBar(i32),
+    /// The finger moved up or down while dragging: the dragged note's
+    /// velocity changes by this much (the drag then no longer counts as a
+    /// tap, so lifting the finger leaves the note).
+    CellVel(i32),
     /// Finger up: a tap on a note's head clears it.
     CellUp,
     SelectTrack(usize),
@@ -397,6 +423,8 @@ pub enum SeqAction {
     BassCellDrag(usize),
     /// Bass: as `CellDragBar`.
     BassCellDragBar(i32),
+    /// Bass: as `CellVel`.
+    BassCellVel(i32),
     /// Bass: as `CellUp`.
     BassCellUp,
     /// Bass: phrase length in bars (1, 2, 4 or 8).
@@ -434,6 +462,17 @@ pub enum SeqAction {
     /// SETUP: move an instrument's MIDI channel by this much (clamped to
     /// 1..16). The lead's channel is the current pattern's.
     Channel(Instrument, i32),
+    /// KEY: hear the key from the microphone (true) or set it by hand.
+    KeyAuto(bool),
+    /// KEY: the tonic set by hand (0 = C ... 11 = B); switches to manual.
+    KeyRoot(u8),
+    /// KEY: the scale set by hand; switches to manual.
+    KeyScale(Scale),
+    /// LEAD or BASS: write a new phrase in the key, at random or by the
+    /// counterpoint rules, from this seed. Replaces the phrase; on the
+    /// lead the eight tracks become the notes of the key up from the
+    /// tonic, on the bass the pitch window scrolls to the tonic.
+    Generate(Instrument, Style, Key, u64),
 }
 
 impl SeqAction {
@@ -465,6 +504,8 @@ struct File {
     bass: Bass,
     #[serde(default)]
     drums: Drums,
+    #[serde(default)]
+    key: KeySetup,
 }
 
 /// The editable model. Every method that changes something returns true, so
@@ -499,6 +540,8 @@ pub struct SeqState {
     pub drum_arm: DrumArm,
     /// Pad taps are written to the phrase while the clock runs.
     pub drum_rec: bool,
+    /// The KEY page: auto or by hand, and the key set by hand.
+    pub key: KeySetup,
     /// The last pad tap, for the playing thread.
     hit: Option<PadHit>,
     /// A finger dragging a note's length on one of the grids.
@@ -545,6 +588,7 @@ impl Default for SeqState {
             drum_bar_lock: false,
             drum_arm: DrumArm::Off,
             drum_rec: false,
+            key: KeySetup::default(),
             hit: None,
             drag: None,
         }
@@ -579,7 +623,8 @@ impl SeqState {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let f: File = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, drums: f.drums, ..SeqState::default() };
+        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, drums: f.drums, key: f.key, ..SeqState::default() };
+        s.key.key.root %= 12;
         s.bass.normalise();
         s.drums.normalise();
         s.patterns.resize_with(PATTERNS, Pattern::default);
@@ -592,7 +637,7 @@ impl SeqState {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone(), drums: self.drums.clone() };
+        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone(), drums: self.drums.clone(), key: self.key };
         let text = toml::to_string(&f).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -669,6 +714,19 @@ impl SeqState {
                 self.bar_lock = true;
                 self.drag = Some(Drag { bar, ..d });
                 self.apply(SeqAction::CellDrag(if dir > 0 { STEPS - 1 } else { 0 }));
+                true
+            }
+            SeqAction::CellVel(dv) => {
+                let Some(d) = self.drag.filter(|d| !d.bass) else {
+                    return false;
+                };
+                self.drag = Some(Drag { moved: true, ..d });
+                let st = &mut self.patterns[cur].tracks[d.track].steps[d.head];
+                let vel = (st.vel as i32 + dv).clamp(1, 127) as u8;
+                if vel == st.vel {
+                    return false;
+                }
+                st.vel = vel;
                 true
             }
             SeqAction::CellUp => {
@@ -818,7 +876,7 @@ impl SeqState {
                         if let Some(h) = covering {
                             b.steps[h as usize].len = ((idx + n - h as usize) % n).max(1) as u16;
                         }
-                        b.steps[idx] = BassStep { on: true, note, len: 1 };
+                        b.steps[idx] = BassStep { on: true, note, len: 1, vel: b.vel };
                         self.drag = Some(drag);
                         true
                     }
@@ -855,6 +913,19 @@ impl SeqState {
                 self.apply(SeqAction::BassCellDrag(if dir > 0 { STEPS - 1 } else { 0 }));
                 true
             }
+            SeqAction::BassCellVel(dv) => {
+                let Some(d) = self.drag.filter(|d| d.bass) else {
+                    return false;
+                };
+                self.drag = Some(Drag { moved: true, ..d });
+                let st = &mut self.bass.steps[d.head];
+                let vel = (st.vel as i32 + dv).clamp(1, 127) as u8;
+                if vel == st.vel {
+                    return false;
+                }
+                st.vel = vel;
+                true
+            }
             SeqAction::BassCellUp => {
                 let Some(d) = self.drag.take().filter(|d| d.bass) else {
                     return false;
@@ -868,7 +939,7 @@ impl SeqState {
                     b.steps[d.head].on = false;
                 } else if d.cell != d.head {
                     b.steps[d.head].len = ((d.cell + n - d.head) % n).max(1) as u16;
-                    b.steps[d.cell] = BassStep { on: true, note: d.note, len: 1 };
+                    b.steps[d.cell] = BassStep { on: true, note: d.note, len: 1, vel: b.vel };
                 } else {
                     return false;
                 }
@@ -906,7 +977,6 @@ impl SeqState {
             SeqAction::BassAdjust(param, d) => {
                 let b = &mut self.bass;
                 match param {
-                    BassParam::Channel => b.channel = (b.channel as i32 + d).clamp(0, 15) as u8,
                     BassParam::Velocity => b.vel = (b.vel as i32 + d).clamp(1, 127) as u8,
                 }
                 true
@@ -1006,7 +1076,6 @@ impl SeqState {
                 let k = &mut self.drums;
                 let dr = &mut k.drums[self.drum.min(DRUMS - 1)];
                 match param {
-                    DrumParam::Channel => k.channel = bump(k.channel, 0, 15),
                     DrumParam::Note => dr.note = bump(dr.note, 0, 127),
                     DrumParam::Velocity => dr.vel = bump(dr.vel, 1, 127),
                     DrumParam::Swing => k.swing = bump(k.swing, SWING_MIN, SWING_MAX),
@@ -1034,6 +1103,144 @@ impl SeqState {
                 *ch = new;
                 true
             }
+            SeqAction::KeyAuto(auto) => {
+                if self.key.auto == auto {
+                    return false;
+                }
+                self.key.auto = auto;
+                true
+            }
+            SeqAction::KeyRoot(root) => {
+                let root = root % 12;
+                if !self.key.auto && self.key.key.root == root {
+                    return false;
+                }
+                self.key.auto = false;
+                self.key.key.root = root;
+                true
+            }
+            SeqAction::KeyScale(scale) => {
+                if !self.key.auto && self.key.key.scale == scale {
+                    return false;
+                }
+                self.key.auto = false;
+                self.key.key.scale = scale;
+                true
+            }
+            SeqAction::Generate(inst, style, key, seed) => self.generate(inst, style, key, seed),
+        }
+    }
+
+    /// The note sounding on each step of the LEAD phrase: the lowest of the
+    /// tracks' notes there.
+    fn lead_line(&self) -> Vec<Option<u8>> {
+        let p = self.pattern();
+        let n = phrase_steps(p.bars);
+        let mut line = vec![None; n];
+        for tr in &p.tracks {
+            if tr.muted {
+                continue;
+            }
+            let map = cover_map(|i| tr.steps[i].on.then_some(tr.steps[i].len as usize), n);
+            for (i, l) in line.iter_mut().enumerate() {
+                if let Some(h) = map[i] {
+                    let note = tr.steps[h as usize].note;
+                    *l = Some(l.map_or(note, |x: u8| x.min(note)));
+                }
+            }
+        }
+        line
+    }
+
+    /// The note sounding on each step of the bass phrase.
+    fn bass_line(&self) -> Vec<Option<u8>> {
+        let b = &self.bass;
+        let n = phrase_steps(b.bars);
+        let map = cover_map(|i| b.steps[i].on.then_some(b.steps[i].len as usize), n);
+        (0..n).map(|i| map[i].map(|h| b.steps[h as usize].note)).collect()
+    }
+
+    /// Whether the bass cell (pitch row of the shown window, step of the
+    /// shown bar) is inside a note of that row: a drag on it changes the
+    /// note's velocity rather than scrolling the window.
+    pub fn bass_has_note(&self, row: usize, k: usize) -> bool {
+        if row >= BASS_ROWS || k >= STEPS {
+            return false;
+        }
+        let b = &self.bass;
+        let n = phrase_steps(b.bars);
+        let idx = self.bass_bar.min(b.bars.max(1) as usize - 1) * STEPS + k;
+        let map = cover_map(|i| b.steps[i].on.then_some(b.steps[i].len as usize), n);
+        map.get(idx).copied().flatten().is_some_and(|h| b.steps[h as usize].note == b.base.saturating_add(row as u8))
+    }
+
+    /// `SeqAction::Generate`.
+    fn generate(&mut self, inst: Instrument, style: Style, key: Key, seed: u64) -> bool {
+        let mut rng = Rng::new(seed);
+        self.drag = None;
+        // velocity of a generated note: by the beat for a composed line, by
+        // chance for a random one
+        let velocity = |base: u8, accent: i8, rng: &mut Rng| -> u8 {
+            let v = match style {
+                Style::Counterpoint => base as i32 + 12 * accent as i32,
+                Style::Random => base as i32 - 30 + rng.below(46) as i32,
+            };
+            v.clamp(1, 127) as u8
+        };
+        match inst {
+            Instrument::Lead => {
+                let bass = self.bass_line();
+                let cur = self.current;
+                let p = &mut self.patterns[cur];
+                let n = phrase_steps(p.bars);
+                let pitches = key.notes_from_tonic(LEAD_GEN_LOW, TRACKS);
+                if pitches.len() < TRACKS {
+                    return false;
+                }
+                let other: Vec<Option<u8>> = if in_key(&bass, key) { (0..n).map(|i| bass[i % bass.len()]).collect() } else { Vec::new() };
+                let v = Voice { pitches: &pitches, other: &other, above: true, polyphony: true };
+                let notes = generate::generate(style, key, &v, n, &mut rng);
+                for (t, tr) in p.tracks.iter_mut().enumerate().take(TRACKS) {
+                    tr.note = pitches[t];
+                    for st in tr.steps.iter_mut().take(n) {
+                        st.on = false;
+                    }
+                }
+                for g in notes {
+                    let Some(t) = pitches.iter().position(|&x| x == g.note) else { continue };
+                    let tr = &mut p.tracks[t];
+                    let vel = velocity(tr.vel, g.accent, &mut rng);
+                    tr.steps[g.start] = Step { on: true, note: g.note, vel, len: g.len };
+                }
+                self.selected_step = None;
+                true
+            }
+            Instrument::Bass => {
+                let lead = self.lead_line();
+                let b = &mut self.bass;
+                let n = phrase_steps(b.bars);
+                let low = key.tonic_at_or_above(BASS_GEN_LOW);
+                let pitches = key.notes_between(low, low + 12);
+                if pitches.is_empty() {
+                    return false;
+                }
+                let other: Vec<Option<u8>> = if in_key(&lead, key) { (0..n).map(|i| lead[i % lead.len()]).collect() } else { Vec::new() };
+                let v = Voice { pitches: &pitches, other: &other, above: false, polyphony: false };
+                let notes = generate::generate(style, key, &v, n, &mut rng);
+                for st in b.steps.iter_mut().take(n) {
+                    st.on = false;
+                }
+                for g in notes {
+                    if b.steps[g.start].on {
+                        continue; // one voice: the first note on a step wins
+                    }
+                    let vel = velocity(b.vel, g.accent, &mut rng);
+                    b.steps[g.start] = BassStep { on: true, note: g.note, len: g.len, vel };
+                }
+                b.base = low.min(BASS_TOP);
+                true
+            }
+            Instrument::Drums => false,
         }
     }
 
@@ -1047,7 +1254,11 @@ impl SeqState {
     }
 }
 
-/// Note name like "C1" (MIDI 36). Octave numbering with middle C = C3.
+/// `generate::in_key_line` for the other voice of a phrase.
+fn in_key(line: &[Option<u8>], key: Key) -> bool {
+    !line.is_empty() && generate::in_key_line(line, key)
+}
+
 /// Grow a phrase from `old` to `new` bars: the bars that come into play are
 /// copies of the ones already there, repeated (a 2-bar phrase made 8 bars
 /// long plays its two bars four times). Shrinking keeps the leading bars and
@@ -1123,6 +1334,7 @@ fn drag_len(d: Drag, k: usize, n: usize, on: impl Fn(usize) -> bool) -> u16 {
     len.min(next).max(1) as u16
 }
 
+/// Note name like "C1" (MIDI 36). Octave numbering with middle C = C3.
 pub fn note_name(n: u8) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     format!("{}{}", NAMES[(n % 12) as usize], (n / 12) as i32 - 2)
@@ -1450,7 +1662,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
                 });
                 let (n_off, sub_off, t_off) = off(a, st.len, 0.0);
                 let p = Pending { n: n_off, sub: sub_off, epoch: g.epoch, shift: 0.0, t_off, channel: b.channel, note: st.note, bass: true };
-                strike(midi, stats, &mut pending, b.vel, p);
+                strike(midi, stats, &mut pending, st.vel, p);
             }
             // --- drums: one-16th hits, plain or accented; every second 16th
             // is held back by the swing and fired from `delayed`.
@@ -1845,13 +2057,13 @@ mod tests {
         s.apply(SeqAction::BassCellDown(3, 4));
         s.apply(SeqAction::BassCellDrag(6));
         s.apply(SeqAction::BassCellUp);
-        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 39, len: 3 });
+        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 39, len: 3, vel: 100 });
         assert!(s.apply(SeqAction::BassSet(5, 4)));
-        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 41, len: 3 });
+        assert_eq!(s.bass.steps[20], BassStep { on: true, note: 41, len: 3, vel: 100 });
         // a tap inside it, in its own row, cuts it and starts a new note there
         assert!(s.apply(SeqAction::BassSet(5, 6)));
         assert_eq!(s.bass.steps[20].len, 2);
-        assert_eq!(s.bass.steps[22], BassStep { on: true, note: 41, len: 1 });
+        assert_eq!(s.bass.steps[22], BassStep { on: true, note: 41, len: 1, vel: 100 });
         // a tap on the head in its own row clears it
         assert!(s.apply(SeqAction::BassSet(5, 4)));
         assert!(!s.bass.steps[20].on);
@@ -1980,8 +2192,6 @@ mod tests {
         assert_eq!(s.drums.swing_shift(), 0.0);
         s.apply(A::DrumAdjust(DrumParam::Note, 4));
         assert_eq!(s.drums.drums[1].note, 42);
-        s.apply(A::DrumAdjust(DrumParam::Channel, -20));
-        assert_eq!(s.drums.channel, 0);
         s.apply(A::DrumAdjust(DrumParam::Velocity, 100));
         assert_eq!(s.drums.drums[1].vel, 127);
         // bars, as the other phrases
@@ -2116,6 +2326,152 @@ mod tests {
         assert!(on && ch == 9 && note == 37 && vel == 100);
         assert!(t_on - (t0 + 0.05) < 0.01, "late by {}", t_on - t0 - 0.05);
         assert!(!ev[1].1 && (ev[1].0 - t_on - 0.1).abs() < 0.01, "{ev:?}");
+    }
+
+    #[test]
+    fn a_vertical_drag_sets_the_velocity() {
+        use SeqAction::*;
+        let mut s = SeqState::default();
+        // lead: down on an empty cell makes the note, dragging up raises it
+        assert!(s.apply(CellDown(2, 3)));
+        assert!(s.apply(CellVel(10)));
+        assert!(!s.apply(CellVel(0)));
+        assert!(!s.apply(CellUp), "moved: lifting the finger keeps the note");
+        assert_eq!(s.pattern().tracks[2].steps[3].vel, 110);
+        assert!(s.pattern().tracks[2].steps[3].on);
+        // on the head of a note: velocity down, still no clearing
+        assert!(!s.apply(CellDown(2, 3)));
+        assert!(s.apply(CellVel(-200)));
+        assert!(!s.apply(CellUp));
+        assert_eq!(s.pattern().tracks[2].steps[3].vel, 1);
+        assert!(s.pattern().tracks[2].steps[3].on);
+        // and clamped at the top; a length drag at the same time still works
+        assert!(!s.apply(CellDown(2, 3)));
+        assert!(s.apply(CellVel(300)));
+        assert!(s.apply(CellDrag(6)));
+        assert!(!s.apply(CellUp));
+        assert_eq!((s.pattern().tracks[2].steps[3].vel, s.pattern().tracks[2].steps[3].len), (127, 4));
+        assert!(!s.apply(CellVel(5)), "no drag, nothing to change");
+        // bass: a new note carries the line's velocity, then its own
+        assert!(s.apply(BassAdjust(BassParam::Velocity, -20)));
+        assert!(s.apply(BassSet(0, 0)));
+        assert_eq!(s.bass.steps[0].vel, 80);
+        assert!(s.bass_has_note(0, 0) && !s.bass_has_note(1, 0) && !s.bass_has_note(0, 1));
+        assert!(!s.apply(BassCellDown(0, 0)));
+        assert!(s.apply(BassCellVel(30)));
+        assert!(s.apply(BassCellDrag(3)));
+        assert!(!s.apply(BassCellUp));
+        assert_eq!((s.bass.steps[0].vel, s.bass.steps[0].len), (110, 4));
+        assert!(s.bass_has_note(0, 2), "inside the note's tail, in its row");
+        assert!(!s.bass_has_note(0, 4));
+        // dragging inside the tail changes the head's velocity
+        assert!(!s.apply(BassCellDown(0, 2)));
+        assert!(s.apply(BassCellVel(-10)));
+        assert!(!s.apply(BassCellUp));
+        assert_eq!(s.bass.steps[0].vel, 100);
+        assert!(!s.apply(BassCellVel(1)));
+        // the velocity survives a save and load, and old files load
+        let dir = std::env::temp_dir().join(format!("vel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patterns.toml");
+        s.save(&path).unwrap();
+        let l = SeqState::load(&path).unwrap();
+        assert_eq!(l.bass.steps[0].vel, 100);
+        assert_eq!(l.bass.vel, 80);
+        let old = "current = 0\npatterns = []\n[bass]\nchannel = 0\nvel = 90\nbars = 1\nbase = 36\n[[bass.steps]]\non = true\nnote = 40\n";
+        std::fs::write(&path, old).unwrap();
+        let l = SeqState::load(&path).unwrap();
+        assert_eq!(l.bass.steps[0], BassStep { on: true, note: 40, len: 1, vel: 100 });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn key_setup_and_generation() {
+        use SeqAction::*;
+        let mut s = SeqState::default();
+        assert!(s.key.auto);
+        assert!(!s.apply(KeyAuto(true)));
+        assert!(s.apply(KeyRoot(9)), "setting a root switches to manual");
+        assert!(!s.key.auto);
+        assert_eq!(s.key.key, Key::new(9, Scale::Major));
+        assert!(s.apply(KeyScale(Scale::Minor)));
+        assert!(!s.apply(KeyScale(Scale::Minor)));
+        assert!(s.apply(KeyAuto(true)));
+        assert!(s.apply(KeyScale(Scale::Minor)), "back to manual, same key");
+        assert_eq!(s.key.key.name(), "A MINOR");
+        // saved with the patterns
+        let dir = std::env::temp_dir().join(format!("key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patterns.toml");
+        s.save(&path).unwrap();
+        assert_eq!(SeqState::load(&path).unwrap().key, s.key);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // a random lead phrase: the tracks are the key's notes up from the
+        // tonic, every note in the key, inside the phrase
+        let key = Key::new(9, Scale::Minor);
+        s.apply(Bars(2));
+        assert!(s.apply(Generate(Instrument::Lead, Style::Random, key, 1)));
+        let p = s.pattern();
+        assert_eq!(p.tracks.iter().map(|t| t.note).collect::<Vec<_>>(), vec![69, 71, 72, 74, 76, 77, 79, 81]);
+        let mut count = 0;
+        for tr in &p.tracks {
+            for (i, st) in tr.steps.iter().enumerate() {
+                if st.on {
+                    count += 1;
+                    assert!(i < 32, "outside the 2-bar phrase");
+                    assert_eq!(st.note, tr.note);
+                    assert!(key.contains(st.note));
+                    assert!((1..=127).contains(&st.vel));
+                }
+            }
+        }
+        assert!(count > 4, "{count} notes");
+        // the same seed gives the same phrase, another seed a different one
+        let mut s2 = s.clone();
+        s2.apply(Generate(Instrument::Lead, Style::Random, key, 1));
+        assert_eq!(s2.patterns, s.patterns);
+        s2.apply(Generate(Instrument::Lead, Style::Random, key, 2));
+        assert_ne!(s2.patterns, s.patterns);
+        // a counterpoint bass line under it: in the key, one voice, the
+        // window scrolled to the tonic, consonant with the lead where it sounds
+        assert!(s.apply(Generate(Instrument::Bass, Style::Counterpoint, key, 3)));
+        assert_eq!(s.bass.base, 33, "A0 at the bottom of the window");
+        let lead = s.lead_line();
+        let n = phrase_steps(s.bass.bars);
+        let bass: Vec<_> = s.bass.steps.iter().take(n).enumerate().filter(|(_, st)| st.on).collect();
+        assert!(bass.len() >= 4);
+        assert!(key.is_tonic(bass[0].1.note) && bass[0].0 == 0);
+        assert!(key.is_tonic(bass.last().unwrap().1.note));
+        for (i, st) in &bass {
+            assert!(key.contains(st.note) && (33..=45).contains(&st.note));
+            assert!(st.vel >= 88 && st.vel <= 112, "velocity follows the beat: {}", st.vel);
+            if let Some(o) = lead[i % lead.len()] {
+                assert!(st.note < o);
+                assert!(matches!((o as i32 - st.note as i32) % 12, 0 | 3 | 4 | 7 | 8 | 9), "step {i}: {} under {o}", st.note);
+            }
+        }
+        // and a counterpoint lead over the bass, on the eight track notes
+        assert!(s.apply(Generate(Instrument::Lead, Style::Counterpoint, key, 4)));
+        let bass_line = s.bass_line();
+        let p = s.pattern();
+        let mut per_step = [0; 32];
+        for tr in &p.tracks {
+            for (i, st) in tr.steps.iter().enumerate().take(32) {
+                if st.on {
+                    per_step[i] += 1;
+                    assert_eq!(st.note, tr.note);
+                    if let Some(o) = bass_line[i % bass_line.len()] {
+                        assert!(matches!((st.note as i32 - o as i32) % 12, 0 | 3 | 4 | 7 | 8 | 9), "step {i}: {} over {o}", st.note);
+                    }
+                }
+            }
+        }
+        assert!(per_step.iter().all(|&c| c <= 1), "a composed line has one voice");
+        assert_eq!(per_step[0], 1, "starts on the downbeat");
+        // drums have no key
+        assert!(!s.apply(Generate(Instrument::Drums, Style::Random, key, 1)));
+        assert!(!Generate(Instrument::Lead, Style::Random, key, 1).view_only());
+        assert!(!KeyRoot(1).view_only());
     }
 
     #[test]

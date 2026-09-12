@@ -11,6 +11,7 @@ periods = 3                           # buffer = periods * period_frames
 capture_channels = 2
 playback_channels = 2
 mic_channel = 0                       # 0-based capture channel with the microphone
+key_channel = -1                      # capture channel for key detection, -1 = the microphone
 click_channels = [0, 1]               # playback channels that get the click
 monitor_gain = 0.0                    # mix the mic into the click outputs (0 = off)
 # Latency ALSA cannot see (USB pipeline, converters). Measure with:
@@ -95,3 +96,15 @@ tap_timeout_s = 2.0                   # taps farther apart than this start a new
 enabled = true                        # 16-step pattern sequencer on the SEQUENCE tab, notes on the MIDI port
 file = "patterns.toml"                # patterns are saved here after every edit (relative to the working dir)
 lead_ms = 0.0                         # extra lead for notes on top of midi.lead_ms
+
+[key]
+enabled = true                        # hear the key of the music on the KEY tab (AUTO); the tab still works by hand without it
+window_s = 12.0                       # seconds of music the key is judged from
+hold_s = 3.0                          # a new key must win this long before it is shown
+profile = "temperley"                 # key profiles: "temperley" or "krumhansl"
+fmin_hz = 55.0                        # analysis range (A1 .. C8)
+fmax_hz = 4000.0
+background_s = 60.0                   # room modes, hum and fans are learned over this long and subtracted
+tuning_hz = 0                         # the band's A4 in Hz; 0 = estimate it from the music
+gate_dbfs = -60.0                     # below this input level nothing is analysed
+silence_reset_s = 8.0                 # silence this long forgets the key

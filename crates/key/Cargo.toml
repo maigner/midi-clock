@@ -1,0 +1,9 @@
+[package]
+name = "key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Key detection from a room microphone: chroma from a long FFT, Krumhansl-Schmuckler key profiles, hysteresis"
+
+[dependencies]
+realfft.workspace = true

@@ -17,6 +17,7 @@ click = { path = "../click" }
 midiclock = { path = "../midiclock" }
 ui = { path = "../ui" }
 sequencer = { path = "../sequencer" }
+key = { path = "../key" }
 libc.workspace = true
 arc-swap.workspace = true
 ringbuf.workspace = true

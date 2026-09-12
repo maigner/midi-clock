@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use embedded_graphics::prelude::DrawTarget;
 
 pub use canvas::{Canvas, PixelFormat, Rotation};
-pub use screen::{Button, Hit, Mode, Page, Screen, Status, View};
-pub use sequencer::SeqAction;
+pub use screen::{effective_key, Button, Hit, Mode, Page, Screen, Status, View, KEY_MIN_CONFIDENCE};
+pub use sequencer::{Instrument, SeqAction, Style};
 pub use touch::{TouchConfig, TouchEvent};
 
 #[derive(Clone, Debug)]
@@ -54,7 +54,10 @@ pub enum Action {
     /// Change the manual tempo by this many BPM.
     Nudge(f64),
     ToggleRun,
-    Relock,
+    /// Write a new LEAD or BASS phrase in the key in effect (the
+    /// application knows it), at random or by the counterpoint rules,
+    /// from this seed.
+    Generate(Instrument, Style, u64),
     Seq(SeqAction),
 }
 
@@ -85,6 +88,13 @@ pub struct Session {
     /// tap is placed on the nearest 16th for recording.
     grid: tracker::Grid,
     drum_bars: u8,
+    /// The sequencer state as of the last frame: whether a bass cell holds
+    /// a note decides what a vertical drag on it does.
+    seq: Option<std::sync::Arc<sequencer::SeqState>>,
+    /// The KEY page's mode and whether a key is known, as of the last
+    /// frame: which buttons are on screen and live.
+    key_auto: bool,
+    key_known: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +114,8 @@ struct CellDrag {
     /// since when: held there, the drag moves on to the next/previous bar.
     edge: i32,
     edge_since: f64,
+    /// y at which the velocity was last changed: moving up raises it.
+    vel_y: i32,
 }
 
 /// How long the finger stays at the edge of the grid before the drag moves
@@ -130,6 +142,9 @@ impl Session {
             pending: None,
             grid: tracker::Grid::default(),
             drum_bars: 1,
+            seq: None,
+            key_auto: true,
+            key_known: false,
         }
     }
 
@@ -162,8 +177,10 @@ impl Session {
                 self.pending = None;
                 self.press_t = t;
                 self.last_repeat = t;
-                match self.screen.hit(lx, ly, self.page) {
+                let hit = self.screen.hit(lx, ly, self.page).filter(|h| !matches!(h, Hit::Button(b) if !b.visible(mode, self.key_auto)));
+                match hit {
                     Some(Hit::Button(Button::PageTempo)) => self.page = Page::Tempo,
+                    Some(Hit::Button(Button::PageKey)) => self.page = Page::Key,
                     Some(Hit::Button(Button::PageLead)) => self.page = Page::Lead,
                     Some(Hit::Button(Button::PageBass)) => self.page = Page::Bass,
                     Some(Hit::Button(Button::PageDrums)) => self.page = Page::Drums,
@@ -177,13 +194,13 @@ impl Session {
                     }
                     Some(Hit::Button(b)) => {
                         self.pressed = Some(b);
-                        if b.enabled(mode) {
+                        if b.enabled(mode, self.key_auto, self.key_known) {
                             dispatch(b, t - self.tap_offset_s, act);
                         }
                     }
                     Some(Hit::Cell(track, step)) => {
                         act(Action::Seq(SeqAction::CellDown(track, step)));
-                        self.cell_drag = Some(CellDrag { bass: false, col: step, edge: 0, edge_since: t });
+                        self.cell_drag = Some(CellDrag { bass: false, col: step, edge: 0, edge_since: t, vel_y: ly });
                     }
                     Some(Hit::Track(track)) => act(Action::Seq(SeqAction::SelectTrack(track))),
                     // The bass grid scrolls with an up/down drag, so the
@@ -206,10 +223,16 @@ impl Session {
                     if dx >= self.screen.bass_col_pitch() / 2 && dx >= dy {
                         self.pending = None;
                         act(Action::Seq(SeqAction::BassCellDown(pc.row, pc.step)));
-                        self.cell_drag = Some(CellDrag { bass: true, col: pc.step, edge: 0, edge_since: t });
+                        self.cell_drag = Some(CellDrag { bass: true, col: pc.step, edge: 0, edge_since: t, vel_y: pc.y });
                     } else if dy >= self.screen.bass_row_pitch() / 2 {
                         self.pending = None;
-                        self.drag_y = Some(pc.y);
+                        // up or down on a note: its velocity; elsewhere: scroll
+                        if self.seq.as_ref().is_some_and(|q| q.bass_has_note(pc.row, pc.step)) {
+                            act(Action::Seq(SeqAction::BassCellDown(pc.row, pc.step)));
+                            self.cell_drag = Some(CellDrag { bass: true, col: pc.step, edge: 0, edge_since: t, vel_y: pc.y });
+                        } else {
+                            self.drag_y = Some(pc.y);
+                        }
                     }
                 }
                 // Dragging the note names or the grid up and down scrolls the
@@ -223,7 +246,8 @@ impl Session {
                     }
                 }
                 // Dragging along a grid row sets the note's length: the note
-                // ends on the column under the finger.
+                // ends on the column under the finger. Up and down sets its
+                // velocity.
                 if let Some(cd) = &mut self.cell_drag {
                     let col = self.screen.column_at(lx, cd.bass);
                     if col != cd.col {
@@ -234,6 +258,12 @@ impl Session {
                     if edge != cd.edge {
                         cd.edge = edge;
                         cd.edge_since = t;
+                    }
+                    let px = self.screen.vel_pixels().max(1);
+                    let dv = (cd.vel_y - ly) / px;
+                    if dv != 0 {
+                        cd.vel_y -= dv * px;
+                        act(Action::Seq(if cd.bass { SeqAction::BassCellVel(dv) } else { SeqAction::CellVel(dv) }));
                     }
                 }
             }
@@ -291,6 +321,9 @@ impl Session {
         self.next_frame = now + self.frame;
         self.grid = status.live;
         self.drum_bars = status.seq.drums.bars;
+        self.seq = Some(status.seq.clone());
+        self.key_auto = status.seq.key.auto;
+        self.key_known = effective_key(&status.seq.key, status.key.as_ref()).is_some();
         let view = View::build_with_touch(status, self.page, self.pressed, self.finger);
         if let Some((bar, _)) = view.seq_bars() {
             if !status.seq.bar_lock && bar != status.seq.shown_bar() {
@@ -395,7 +428,7 @@ pub fn run(
 
 fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
     let a = match b {
-        Button::PageTempo | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => return,
+        Button::PageTempo | Button::PageKey | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => return,
         Button::ModeAuto => Action::SetMode(Mode::Auto),
         Button::ModeManual => Action::SetMode(Mode::Manual),
         Button::Minus5 => Action::Nudge(-5.0),
@@ -404,7 +437,12 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::Plus1 => Action::Nudge(1.0),
         Button::Plus5 => Action::Nudge(5.0),
         Button::StartStop => Action::ToggleRun,
-        Button::Relock => Action::Relock,
+        Button::KeyAuto => Action::Seq(SeqAction::KeyAuto(true)),
+        Button::KeyManual => Action::Seq(SeqAction::KeyAuto(false)),
+        Button::KeyRoot(pc) => Action::Seq(SeqAction::KeyRoot(pc)),
+        Button::KeyScale(sc) => Action::Seq(SeqAction::KeyScale(sc)),
+        // the press time is the seed: every press writes a different phrase
+        Button::Generate(inst, style) => Action::Generate(inst, style, t.to_bits()),
         Button::ParamMinus(p) => Action::Seq(SeqAction::Adjust(p, -1)),
         Button::ParamPlus(p) => Action::Seq(SeqAction::Adjust(p, 1)),
         Button::Bars(n) => Action::Seq(SeqAction::Bars(n)),

@@ -19,8 +19,6 @@ pub struct Live {
     pub tracker_grid: ArcSwap<Grid>,
     /// Tracker thread: take over the live grid on the next hop.
     pub adopt: AtomicBool,
-    /// Tracker thread: throw the tempo away and lock again.
-    pub relock: AtomicBool,
 }
 
 impl Live {
@@ -31,7 +29,6 @@ impl Live {
             grid: ArcSwap::from_pointee(Grid::default()),
             tracker_grid: ArcSwap::from_pointee(Grid::default()),
             adopt: AtomicBool::new(false),
-            relock: AtomicBool::new(false),
         }
     }
 

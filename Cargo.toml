@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rtio",
     "crates/onset",
+    "crates/key",
     "crates/tracker",
     "crates/click",
     "crates/midiclock",

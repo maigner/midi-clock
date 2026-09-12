@@ -8,6 +8,7 @@ description = "Touch-screen front end drawn straight to the Linux framebuffer, t
 [dependencies]
 tracker = { path = "../tracker" }
 sequencer = { path = "../sequencer" }
+key = { path = "../key" }
 rtio = { path = "../rtio" }
 libc.workspace = true
 embedded-graphics = "0.8"

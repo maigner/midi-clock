@@ -13,6 +13,48 @@ pub struct Config {
     pub realtime: Realtime,
     pub ui: Ui,
     pub sequencer: Sequencer,
+    pub key: KeyDet,
+}
+
+/// Key detection from the microphone (`crates/key`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyDet {
+    pub enabled: bool,
+    /// Integration time of the chroma (seconds).
+    pub window_s: f32,
+    /// A new key must win this long before it is shown (seconds).
+    pub hold_s: f32,
+    /// "temperley" or "krumhansl".
+    pub profile: String,
+    pub fmin_hz: f32,
+    pub fmax_hz: f32,
+    /// Stationary-noise (room modes, hum) removal time constant (seconds).
+    pub background_s: f32,
+    /// A4 in Hz; 0 = estimate the band's tuning from the music.
+    pub tuning_hz: f32,
+    /// Below this level (dBFS) the input counts as silence.
+    pub gate_dbfs: f32,
+    /// After this much silence the key is forgotten (seconds).
+    pub silence_reset_s: f32,
+}
+
+impl Default for KeyDet {
+    fn default() -> Self {
+        let d = key::KeyConfig::default();
+        Self {
+            enabled: true,
+            window_s: d.window_s,
+            hold_s: d.hold_s,
+            profile: "temperley".into(),
+            fmin_hz: d.fmin_hz,
+            fmax_hz: d.fmax_hz,
+            background_s: d.background_s,
+            tuning_hz: 0.0,
+            gate_dbfs: d.gate_dbfs,
+            silence_reset_s: d.silence_reset_s,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +87,8 @@ pub struct Audio {
     pub playback_channels: usize,
     /// Which capture channel carries the microphone (0-based).
     pub mic_channel: usize,
+    /// Capture channel for key detection (0-based); negative = the mic.
+    pub key_channel: i64,
     /// Playback channels that receive the click.
     pub click_channels: Vec<usize>,
     /// Mix the microphone into the playback channels at this gain (0 = off).
@@ -66,6 +110,7 @@ impl Default for Audio {
             capture_channels: 2,
             playback_channels: 2,
             mic_channel: 0,
+            key_channel: -1,
             click_channels: vec![0, 1],
             monitor_gain: 0.0,
             extra_input_latency_ms: 1.0,
@@ -335,6 +380,23 @@ impl Config {
             onset_offset_s: t.onset_offset_ms / 1000.0,
             bar_len: t.bar_len,
             full_weight_strength: t.full_weight_strength,
+        }
+    }
+
+    pub fn key(&self) -> key::KeyConfig {
+        let k = &self.key;
+        key::KeyConfig {
+            sample_rate: self.audio.sample_rate as f32,
+            window_s: k.window_s,
+            hold_s: k.hold_s,
+            profile: if k.profile.eq_ignore_ascii_case("krumhansl") { key::Profile::Krumhansl } else { key::Profile::Temperley },
+            fmin_hz: k.fmin_hz,
+            fmax_hz: k.fmax_hz,
+            background_s: k.background_s,
+            tuning_hz: (k.tuning_hz > 0.0).then_some(k.tuning_hz),
+            gate_dbfs: k.gate_dbfs,
+            silence_reset_s: k.silence_reset_s,
+            ..key::KeyConfig::default()
         }
     }
 
