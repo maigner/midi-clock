@@ -2,3 +2,4 @@
 *.wav
 /test-data/generated/
 patterns.toml
+.env

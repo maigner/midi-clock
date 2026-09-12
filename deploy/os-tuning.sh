@@ -46,7 +46,7 @@ cat > /etc/security/limits.d/audio.conf <<LIM
 LIM
 
 echo "== services not needed on a clock box"
-for s in bluetooth.service avahi-daemon.service triggerhappy.service; do
+for s in bluetooth.service triggerhappy.service; do   # avahi stays: midi-clock.local is how the Pi is found on a phone hotspot
   systemctl disable --now "$s" 2>/dev/null || true
 done
 
