@@ -17,6 +17,7 @@ usermod -a -G audio,video,input,tty midiclock
 mkdir -p "$CFG_DIR"
 [ -f "$CFG_DIR/config.toml" ] || install -m 0644 "$HERE/config.example.toml" "$CFG_DIR/config.toml"
 chown -R midiclock:audio "$CFG_DIR"
+install -m 0755 "$HERE/wait-for-audio.sh" "$BIN_DIR/midi-clock-wait-audio"
 install -m 0644 "$HERE/midi-clock.service" /etc/systemd/system/midi-clock.service
 cat > /etc/security/limits.d/midi-clock.conf <<LIM
 @audio - rtprio 95

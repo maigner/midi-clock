@@ -447,8 +447,26 @@ Nothing else is needed for this: no interface, no tuning script, no service.
    +5/-5 (hold for repeat), STOP, START, and the AUTO tab (it will say
    LISTENING, there is no microphone). Ctrl-C ends it and clears the screen.
 
-With the interface attached later, drop `--no-audio --no-midi` and follow the
-bring-up list above.
+6. **Start it on power-on** (no interface needed): install the service and
+   tell the config there is no audio yet:
+   ```sh
+   sudo deploy/install.sh
+   sudo sed -i -E '/^\[audio\]/,/^\[/ s/^enabled = true /enabled = false/' /etc/midi-clock/config.toml
+   sudo sed -i -E 's/^device = "hw:CARD=US2x2,0,0"/device = "virtual"/; s/^start_mode = "auto"/start_mode = "manual"/' /etc/midi-clock/config.toml
+   sudo cp patterns.toml /etc/midi-clock/ && sudo chown midiclock:audio /etc/midi-clock/patterns.toml   # keep your patterns
+   sudo systemctl start midi-clock
+   ```
+   The UI is on the screen about six seconds after the kernel is up and runs as
+   the `midiclock` user with `/etc/midi-clock` as its working directory, so
+   patterns are saved there. The sequencer's notes go to a virtual ALSA
+   sequencer port `midi-clock:out` until a real interface is entered in
+   `[midi] device`. Logs: `journalctl -u midi-clock -f`. To try a fresh build
+   by hand, stop the service first (`sudo systemctl stop midi-clock`); to
+   deploy it, rerun `sudo deploy/install.sh` and `sudo systemctl restart
+   midi-clock`.
+
+With the interface attached later, set `[audio] enabled = true` and the device
+names in `/etc/midi-clock/config.toml` and follow the bring-up list above.
 
 ## Offline evaluation
 
