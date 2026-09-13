@@ -117,6 +117,7 @@ impl ManualClock {
             let (n, _) = self.grid.nearest_beat(t);
             if k == 1 {
                 self.grid.downbeat = n.rem_euclid(bar) as u32;
+                self.grid.downbeat_known = true;
             }
             if n < self.grid.n0 {
                 // Still counting in towards the start beat: keep it, move the grid.
@@ -132,6 +133,7 @@ impl ManualClock {
             self.grid.t0 = t + (start - last) as f64 * self.grid.period;
             self.grid.n0 = start;
             self.grid.downbeat = 0;
+            self.grid.downbeat_known = true;
             self.grid.epoch = self.grid.epoch.wrapping_add(1);
             self.grid.running = true;
             self.grid.state = State::Running;
@@ -146,7 +148,9 @@ impl ManualClock {
         }
         self.grid.t0 = now + self.cfg.start_delay_s;
         self.grid.n0 = 0;
+        // START defines beat 0 as the one: the sequencers begin their bar there.
         self.grid.downbeat = 0;
+        self.grid.downbeat_known = true;
         self.grid.epoch = self.grid.epoch.wrapping_add(1);
         self.grid.running = true;
         self.grid.state = State::Running;

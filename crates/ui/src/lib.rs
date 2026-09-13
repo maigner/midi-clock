@@ -95,7 +95,19 @@ pub struct Session {
     /// frame: which buttons are on screen and live.
     key_auto: bool,
     key_known: bool,
+    /// The big number: the live tempo smoothed over `BPM_SMOOTH_S`, and
+    /// the value printed, which only follows it outside a small deadband.
+    bpm_smooth: f64,
+    bpm_printed: f64,
+    bpm_at: f64,
 }
+
+/// Time constant of the smoothing of the big tempo number.
+const BPM_SMOOTH_S: f64 = 2.0;
+/// The printed tempo only moves when the smoothed one is this far away.
+const BPM_DEADBAND: f64 = 0.25;
+/// A change bigger than this (relock, manual +/-) is shown at once.
+const BPM_JUMP: f64 = 4.0;
 
 #[derive(Clone, Copy)]
 struct PendingCell {
@@ -145,7 +157,31 @@ impl Session {
             seq: None,
             key_auto: true,
             key_known: false,
+            bpm_smooth: 0.0,
+            bpm_printed: 0.0,
+            bpm_at: 0.0,
         }
+    }
+
+    /// The tempo to print for `status`: the live grid's, smoothed while the
+    /// tracker is running so that its per-onset corrections do not make
+    /// the last digit flicker. Manual tempo and jumps are shown exactly.
+    fn shown_bpm(&mut self, now: f64, status: &Status) -> f64 {
+        let target = status.live.bpm();
+        let dt = (now - self.bpm_at).clamp(0.0, 1.0);
+        self.bpm_at = now;
+        let smooth = status.mode == Mode::Auto && status.live.running && (target - self.bpm_smooth).abs() < BPM_JUMP;
+        if smooth {
+            let a = 1.0 - (-dt / BPM_SMOOTH_S).exp();
+            self.bpm_smooth += a * (target - self.bpm_smooth);
+            if (self.bpm_smooth - self.bpm_printed).abs() >= BPM_DEADBAND {
+                self.bpm_printed = self.bpm_smooth;
+            }
+        } else {
+            self.bpm_smooth = target;
+            self.bpm_printed = target;
+        }
+        self.bpm_printed
     }
 
     pub fn page(&self) -> Page {
@@ -324,6 +360,8 @@ impl Session {
         self.seq = Some(status.seq.clone());
         self.key_auto = status.seq.key.auto;
         self.key_known = effective_key(&status.seq.key, status.key.as_ref()).is_some();
+        let bpm_shown = self.shown_bpm(now, status);
+        let status = &Status { bpm_shown: Some(bpm_shown), ..status.clone() };
         let view = View::build_with_touch(status, self.page, self.pressed, self.finger);
         if let Some((bar, _)) = view.seq_bars() {
             if !status.seq.bar_lock && bar != status.seq.shown_bar() {

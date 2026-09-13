@@ -51,6 +51,10 @@ pub struct Status {
     pub seq: std::sync::Arc<SeqState>,
     /// What the key detector hears, if anything.
     pub key: Option<key::KeyEstimate>,
+    /// Tempo to print as the big number instead of `live.bpm()`: the
+    /// session smooths the live grid's tempo so that the per-onset
+    /// corrections do not make the last digit flicker.
+    pub bpm_shown: Option<f64>,
 }
 
 /// The key in effect: the detector's, while it is confident enough, when
@@ -701,7 +705,7 @@ impl View {
         let bpm = if s.mode == Mode::Auto && !s.tracker.running && s.tracker.state != State::Coasting {
             "---.-".to_string()
         } else {
-            format!("{:5.1}", live.bpm())
+            format!("{:5.1}", s.bpm_shown.unwrap_or_else(|| live.bpm()))
         };
         let (info, conf_pct) = match s.mode {
             Mode::Auto => (format!("TEMPO STRENGTH {:.2}", s.tempo_strength), Some((s.tracker.confidence * 100.0) as u32)),
@@ -1780,6 +1784,7 @@ mod tests {
             now: 103.02,
             seq: std::sync::Arc::new(seq),
             key: None,
+            bpm_shown: None,
         }
     }
 

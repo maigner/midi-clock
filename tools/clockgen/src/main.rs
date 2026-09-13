@@ -122,6 +122,7 @@ fn run(
         confidence: 1.0,
         bar_len: 4,
         downbeat: 0,
+        downbeat_known: true,
     };
     let stats = Arc::new(midiclock::ClockStats::default());
     let midi_thread = match midi {
@@ -224,6 +225,7 @@ fn latency(seconds: f64, channel: usize, audio: AudioArgs, stop: Arc<AtomicBool>
         confidence: 1.0,
         bar_len: 4,
         downbeat: 0,
+        downbeat_known: true,
     };
     let mut synth = click::ClickSynth::new(click::ClickConfig {
         sample_rate: fs as f32,

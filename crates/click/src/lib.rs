@@ -11,6 +11,9 @@ pub struct ClickConfig {
     pub duration_s: f32,
     pub gain: f32,
     pub accent_gain: f32,
+    /// Gain multiplier while the tracker is coasting (no hits on the beat
+    /// lately): the click tells the players it is guessing.
+    pub coast_gain: f32,
     /// Emit the click this much earlier than the beat time (seconds).
     pub lead_s: f64,
 }
@@ -24,6 +27,7 @@ impl Default for ClickConfig {
             duration_s: 0.006,
             gain: 0.5,
             accent_gain: 0.8,
+            coast_gain: 0.4,
             lead_s: 0.0,
         }
     }
@@ -56,9 +60,9 @@ impl ClickSynth {
         &self.cfg
     }
 
-    fn trigger(&mut self, accent: bool) {
+    fn trigger(&mut self, accent: bool, coasting: bool) {
         let f = if accent { self.cfg.accent_freq_hz } else { self.cfg.freq_hz };
-        let amp = if accent { self.cfg.accent_gain } else { self.cfg.gain };
+        let amp = if accent { self.cfg.accent_gain } else { self.cfg.gain } * if coasting { self.cfg.coast_gain } else { 1.0 };
         // Decay to ~5 % over the click length.
         let decay = (-3.0 / self.length as f32).exp();
         self.voice = Some(Voice {
@@ -80,6 +84,7 @@ impl ClickSynth {
         }
         let fs = self.cfg.sample_rate as f64;
         let frames = mono.len();
+        let coasting = grid.state == tracker::State::Coasting;
         let mut triggers: [(usize, bool); 4] = [(usize::MAX, false); 4];
         let mut nt = 0;
         if grid.running && grid.period > 0.01 {
@@ -97,7 +102,7 @@ impl ClickSynth {
             while grid.beat_time(n) - lead < buf_end && nt < triggers.len() {
                 if n > self.last_beat {
                     let idx = ((grid.beat_time(n) - lead - buf_start) * fs).round().max(0.0) as usize;
-                    triggers[nt] = (idx.min(frames - 1), grid.is_downbeat(n));
+                    triggers[nt] = (idx.min(frames - 1), grid.accent(n));
                     nt += 1;
                     self.last_beat = n;
                 }
@@ -107,7 +112,7 @@ impl ClickSynth {
         let mut ti = 0;
         for (i, out) in mono.iter_mut().enumerate() {
             while ti < nt && triggers[ti].0 == i {
-                self.trigger(triggers[ti].1);
+                self.trigger(triggers[ti].1, coasting);
                 ti += 1;
             }
             if let Some(v) = &mut self.voice {

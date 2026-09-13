@@ -111,6 +111,10 @@ pub struct Tracker {
     hit_beat: i64,
     misses: u32,
     beat_kick: VecDeque<(i64, f32)>,
+    /// Consecutive beats on which the same phase won decisively (see
+    /// `accumulate_downbeat`), and that phase.
+    downbeat_streak: u32,
+    downbeat_last: u32,
     est: tempo::Estimator,
     /// Diagnostics.
     pub last_tempo_strength: f64,
@@ -139,6 +143,8 @@ impl Tracker {
             hit_beat: i64::MIN,
             misses: 0,
             beat_kick: VecDeque::new(),
+            downbeat_streak: 0,
+            downbeat_last: 0,
             est,
             last_tempo_strength: 0.0,
             corrections: 0,
@@ -171,6 +177,7 @@ impl Tracker {
         self.last_est_hop = self.hops;
         self.est_history.clear();
         self.beat_kick.clear();
+        self.forget_downbeat();
     }
 
     /// Throw away the tempo estimate and lock again from the ODF history. The
@@ -271,6 +278,8 @@ impl Tracker {
             self.grid.n0 = n;
             self.next_eval_beat = n;
             self.relocks += 1;
+            // The beats were re-placed: the one has to prove itself again.
+            self.forget_downbeat();
         } else {
             self.grid.t0 = t0;
             self.grid.n0 = 0;
@@ -279,6 +288,7 @@ impl Tracker {
             self.grid.downbeat = 0;
             self.next_eval_beat = 0;
             self.beat_kick.clear();
+            self.forget_downbeat();
         }
         self.grid.confidence = 0.5;
         self.grid.state = State::Running;
@@ -299,7 +309,8 @@ impl Tracker {
                 let dphase = (self.cfg.kp * err * w).clamp(-max_slew, max_slew);
                 let dperiod = (self.cfg.ki * err * w).clamp(-0.02 * p, 0.02 * p);
                 self.grid.t0 += dphase;
-                self.grid.period += dperiod;
+                // Hits may pull the period, but never out of the configured tempo window.
+                self.grid.period = (self.grid.period + dperiod).clamp(60.0 / self.cfg.bpm_max, 60.0 / self.cfg.bpm_min);
                 self.hit_beat = n;
                 self.corrections += 1;
                 if self.grid.state == State::Coasting {
@@ -329,6 +340,7 @@ impl Tracker {
             self.grid.running = false;
             self.grid.confidence = 0.0;
             self.est_history.clear();
+            self.forget_downbeat();
             return;
         }
         // 3. Periodic tempo re-estimation.
@@ -374,6 +386,15 @@ impl Tracker {
         )
     }
 
+    /// Kick energy around beat `n` goes into a 16-beat history. `downbeat`
+    /// follows the phase of the bar with the most kick as soon as one wins
+    /// by `DOWNBEAT_MARGIN`; the sequencers align their bars to it, so a
+    /// guess is better than nothing there. `downbeat_known`, which the
+    /// accent click needs, asks for more: the same phase must win for a
+    /// whole bar in a row, and the configured bar length must explain the
+    /// kick pattern better than a bar of `ALT_BAR_LEN` beats does. A kick
+    /// on one and three of a 4/4 bar never gets there: the one is then not
+    /// known, only guessed.
     fn accumulate_downbeat(&mut self, n: i64) {
         let t = self.grid.beat_time(n);
         let half = ((0.15 * self.grid.period) / self.cfg.hop_dt).round() as i64;
@@ -388,21 +409,49 @@ impl Tracker {
         while self.beat_kick.len() > 16 {
             self.beat_kick.pop_front();
         }
-        let bar = self.grid.bar_len as i64;
-        if self.beat_kick.len() < 2 * bar as usize {
+        let bar = self.grid.bar_len;
+        if bar < 2 || self.beat_kick.len() < 2 * bar as usize {
             return;
         }
-        let mut sums = vec![0.0f32; bar as usize];
-        for &(b, e) in &self.beat_kick {
-            sums[(b.rem_euclid(bar)) as usize] += e;
+        let (best, margin) = phase_margin(&self.beat_kick, bar);
+        if margin > DOWNBEAT_MARGIN {
+            self.grid.downbeat = best;
         }
-        let (best, best_v) = sums.iter().enumerate().fold((0, f32::MIN), |a, (i, &v)| if v > a.1 { (i, v) } else { a });
-        let second = sums.iter().enumerate().filter(|(i, _)| *i != best).map(|(_, &v)| v).fold(0.0f32, f32::max);
-        if best_v > 1.3 * second {
-            self.grid.downbeat = best as u32;
+        let alt = if bar == ALT_BAR_LEN { 4 } else { ALT_BAR_LEN };
+        let (_, alt_margin) = phase_margin(&self.beat_kick, alt);
+        let decisive = margin > DOWNBEAT_MARGIN && margin > alt_margin;
+        if decisive && best == self.downbeat_last {
+            self.downbeat_streak += 1;
+        } else {
+            self.downbeat_streak = u32::from(decisive);
+            self.downbeat_last = best;
         }
+        self.grid.downbeat_known = self.downbeat_streak >= bar;
+    }
+
+    fn forget_downbeat(&mut self) {
+        self.grid.downbeat_known = false;
+        self.downbeat_streak = 0;
     }
 }
+
+/// The best phase of a `bar`-beat bar in `hist` (beat index, kick energy),
+/// and how much more kick it has than the runner-up (1.0 = none).
+fn phase_margin(hist: &VecDeque<(i64, f32)>, bar: u32) -> (u32, f32) {
+    let mut sums = vec![0.0f32; bar as usize];
+    for &(b, e) in hist {
+        sums[b.rem_euclid(bar as i64) as usize] += e;
+    }
+    let (best, best_v) = sums.iter().enumerate().fold((0, f32::MIN), |a, (i, &v)| if v > a.1 { (i, v) } else { a });
+    let second = sums.iter().enumerate().filter(|(i, _)| *i != best).map(|(_, &v)| v).fold(0.0f32, f32::max);
+    let margin = if second > 1e-6 { best_v / second } else if best_v > 1e-6 { 10.0 } else { 1.0 };
+    (best as u32, margin)
+}
+
+/// Kick on the winning beat has to exceed the runner-up by this factor.
+const DOWNBEAT_MARGIN: f32 = 1.3;
+/// The other meter the kick pattern is checked against.
+const ALT_BAR_LEN: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -440,6 +489,91 @@ mod tests {
             }
         }
         (tr, truth, emitted)
+    }
+
+    /// A pulse train whose kick energy on beat `i` (0-based) is `kick(i)`.
+    fn run_kick_train(bpm: f64, seconds: f64, kick: impl Fn(usize) -> f32) -> Tracker {
+        let cfg = TrackerConfig::default();
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let period = 60.0 / bpm;
+        let mut next_beat = 0.5;
+        let mut beat = 0usize;
+        let hops = (seconds / dt) as u64;
+        for i in 0..hops {
+            let t = (i + 1) as f64 * dt;
+            let (mut odf, mut k, mut onset) = (0.3, 0.1, None);
+            if t >= next_beat && t - dt < next_beat {
+                odf = 8.0;
+                k = kick(beat);
+                onset = Some((next_beat, 8.0));
+                next_beat += period;
+                beat += 1;
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: k, onset });
+        }
+        tr
+    }
+
+    #[test]
+    fn kick_on_one_of_four_establishes_the_downbeat() {
+        let tr = run_kick_train(120.0, 20.0, |i| if i % 4 == 1 { 8.0 } else { 1.0 });
+        let g = tr.grid();
+        assert!(g.running);
+        assert!(g.downbeat_known, "the one should be known after a few bars");
+        // beat i of the train is grid beat i - lock offset; the phase must be the accented one
+        let accented: Vec<i64> = (0..8).map(|n| n as i64).filter(|&n| g.accent(n)).collect();
+        assert_eq!(accented.len(), 2, "one accent per 4 beats: {accented:?}");
+        assert_eq!(accented[1] - accented[0], 4);
+    }
+
+    #[test]
+    fn even_kicks_leave_the_downbeat_unknown() {
+        let tr = run_kick_train(120.0, 20.0, |_| 4.0);
+        let g = tr.grid();
+        assert!(g.running);
+        assert!(!g.downbeat_known, "no kick pattern, no known one");
+        assert!((0..8).all(|n| !g.accent(n)), "no accent without a known one");
+    }
+
+    #[test]
+    fn kick_on_one_and_three_leaves_the_downbeat_unknown() {
+        let tr = run_kick_train(120.0, 20.0, |i| if i % 2 == 0 { 8.0 } else { 1.0 });
+        assert!(!tr.grid().downbeat_known, "one and three cannot be told apart");
+    }
+
+    #[test]
+    fn three_beat_kick_pattern_does_not_fit_a_four_beat_bar() {
+        let tr = run_kick_train(120.0, 24.0, |i| if i % 3 == 0 { 8.0 } else { 1.0 });
+        assert!(!tr.grid().downbeat_known, "a 3/4 kick pattern is not a known one in 4/4");
+    }
+
+    #[test]
+    fn hits_cannot_drag_the_period_out_of_the_tempo_window() {
+        // Lock at 120, then feed hits that keep landing late so the period grows.
+        let cfg = TrackerConfig { bpm_min: 100.0, bpm_max: 140.0, ..TrackerConfig::default() };
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let mut next = 0.5;
+        let mut period = 0.5;
+        let hops = (40.0 / dt) as u64;
+        for i in 0..hops {
+            let t = (i + 1) as f64 * dt;
+            let (mut odf, mut onset) = (0.3, None);
+            if t >= next && t - dt < next {
+                odf = 8.0;
+                onset = Some((next, 8.0));
+                if t > 8.0 {
+                    period *= 1.02; // slowing down without end
+                }
+                next += period;
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: odf, onset });
+            let g = tr.grid();
+            if g.running {
+                assert!(g.bpm() >= 100.0 - 1e-6 && g.bpm() <= 140.0 + 1e-6, "bpm {} left the window at {t}s", g.bpm());
+            }
+        }
     }
 
     #[test]

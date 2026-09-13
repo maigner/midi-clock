@@ -233,6 +233,8 @@ pub struct Click {
     pub duration_ms: f32,
     pub gain: f32,
     pub accent_gain: f32,
+    /// Gain multiplier while the tracker is coasting.
+    pub coast_gain: f32,
     pub lead_ms: f64,
 }
 
@@ -246,6 +248,7 @@ impl Default for Click {
             duration_ms: d.duration_s * 1000.0,
             gain: d.gain,
             accent_gain: d.accent_gain,
+            coast_gain: d.coast_gain,
             lead_ms: 0.0,
         }
     }
@@ -409,6 +412,7 @@ impl Config {
             duration_s: c.duration_ms / 1000.0,
             gain: c.gain,
             accent_gain: c.accent_gain,
+            coast_gain: c.coast_gain,
             lead_s: c.lead_ms / 1000.0,
         }
     }

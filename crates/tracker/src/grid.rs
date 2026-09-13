@@ -34,6 +34,11 @@ pub struct Grid {
     pub bar_len: u32,
     /// Beats `n` with `n % bar_len == downbeat` are beat one of a bar.
     pub downbeat: u32,
+    /// Whether `downbeat` is established rather than assumed: set by a tap
+    /// count-in, or by the tracker once the kick pattern names one beat
+    /// decisively for a whole bar and fits `bar_len` better than another
+    /// meter. The accent click needs it.
+    pub downbeat_known: bool,
 }
 
 impl Default for Grid {
@@ -48,6 +53,7 @@ impl Default for Grid {
             confidence: 0.0,
             bar_len: 4,
             downbeat: 0,
+            downbeat_known: false,
         }
     }
 }
@@ -80,6 +86,13 @@ impl Grid {
     #[inline]
     pub fn is_downbeat(&self, n: i64) -> bool {
         self.bar_len > 0 && (n - self.downbeat as i64).rem_euclid(self.bar_len as i64) == 0
+    }
+
+    /// Whether beat `n` gets the accent: it is beat one of a bar and the
+    /// one is known, not guessed.
+    #[inline]
+    pub fn accent(&self, n: i64) -> bool {
+        self.downbeat_known && self.is_downbeat(n)
     }
 
     /// Time of MIDI tick `m` (0..24) of beat `n`.

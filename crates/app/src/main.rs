@@ -86,6 +86,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
         now,
         seq: Arc::new(SeqState::default()),
         key: None,
+        bpm_shown: None,
     };
     std::fs::write(path, ui::snapshot(w, h, &st, Page::Tempo, None))?;
     let manual = path.with_extension("manual.ppm");
@@ -591,6 +592,7 @@ fn main() -> Result<()> {
                             now: rtio::now(),
                             seq: seq.borrow().clone(),
                             key: **key_est.load(),
+                            bpm_shown: None,
                         }
                     };
                     let act = |a: Action| {

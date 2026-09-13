@@ -34,6 +34,10 @@ pub enum Mode {
     Minor,
 }
 
+/// Confidence a new key needs, every frame of its hold time, to replace
+/// the shown one. Below it the shown key stays and only its confidence drops.
+const CHALLENGER_MARGIN: f32 = 0.2;
+
 #[derive(Clone, Debug)]
 pub struct KeyConfig {
     pub sample_rate: f32,
@@ -546,6 +550,10 @@ impl KeyDetector {
                 self.candidate = None;
             }
             Some(shown) if shown == (t_best, m_best) => self.candidate = None,
+            // A challenger only counts while it wins by a margin of its own:
+            // a chromatic passage, where nothing wins, must not unseat the
+            // key that was established before it.
+            Some(_) if margin(r_best, r_second) < CHALLENGER_MARGIN => self.candidate = None,
             Some(_) => {
                 let c = match self.candidate {
                     Some((t, m, k)) if (t, m) == (t_best, m_best) => (t, m, k + 1),

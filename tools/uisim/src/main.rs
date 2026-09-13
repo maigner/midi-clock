@@ -311,6 +311,7 @@ fn main() -> Result<()> {
                 now,
                 seq: seq.clone(),
                 key: heard_key,
+                bpm_shown: None,
             };
             let mut act = |a: Action| apply(a, &mut mode, &mut tracker, &mut manual, &mut live, &mut seq, &seq_snapshot, &mut seq_dirty, heard_key, now);
             if session.frame(now, &st, &mut act) {
