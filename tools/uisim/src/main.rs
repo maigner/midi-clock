@@ -304,6 +304,7 @@ fn main() -> Result<()> {
                 tracker: tracker.grid(),
                 tempo_strength: tracker.last_tempo_strength as f32,
                 level_db: level,
+                clipping: false,
                 xruns: 0,
                 ticks,
                 midi: true,

@@ -79,6 +79,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
         tracker: grid,
         tempo_strength: 0.41,
         level_db: -18.0,
+        clipping: false,
         xruns: 0,
         ticks: 12345,
         midi: true,
@@ -182,6 +183,11 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
     Ok(())
 }
 
+/// Input samples at or above this are counted as clipped (full scale is 1.0).
+const CLIP_LEVEL: f32 = 0.98;
+/// The level meter and the clip flag hold for this long.
+const LEVEL_HOLD_S: f64 = 1.5;
+
 /// One hop of analysis, audio thread -> tracker thread.
 #[derive(Clone, Copy)]
 struct HopMsg {
@@ -195,7 +201,11 @@ struct HopMsg {
 struct Shared {
     stop: AtomicBool,
     xruns: AtomicU64,
-    level_milli_db: AtomicU32, // input peak level in dB * -1000 (u32)
+    level_milli_db: AtomicU32, // input peak level in dB * -1000 (u32), held for ~1.5 s
+    /// Input samples at or above `CLIP_LEVEL` so far.
+    clipped: AtomicU64,
+    /// The input clipped within the last ~1.5 s.
+    clipping: AtomicBool,
     clicks: AtomicU64,
     hops: AtomicU64,
     onsets: AtomicU64,
@@ -459,6 +469,12 @@ fn main() -> Result<()> {
                 let mut click_mono = vec![0f32; period];
                 let mut outbuf = vec![0f32; period * play_ch];
                 let mut total: u64 = 0;
+                // Peak hold for the level readout: one 1 ms period every 5 s
+                // misses most peaks, so the loudest moment is held and decays.
+                let mut hold = 0f32;
+                let hold_decay = (-(period as f64 / fs) / LEVEL_HOLD_S).exp() as f32;
+                let clip_hold_periods = (LEVEL_HOLD_S * fs / period as f64) as u32;
+                let mut clip_periods = 0u32;
                 if let Err(e) = duplex.start() {
                     eprintln!("audio start failed: {e:#}");
                     shared.audio_error.store(true, Ordering::Relaxed);
@@ -476,12 +492,23 @@ fn main() -> Result<()> {
                     };
                     total += period as u64;
                     let mut peak = 0f32;
+                    let mut clipped = 0u64;
                     for (i, m) in mono.iter_mut().enumerate() {
                         *m = inbuf[i * cap_ch + mic];
-                        peak = peak.max(m.abs());
+                        let a = m.abs();
+                        peak = peak.max(a);
+                        clipped += u64::from(a >= CLIP_LEVEL);
                     }
-                    let db = 20.0 * (peak + 1e-9).log10();
+                    hold = if peak >= hold { peak } else { hold * hold_decay };
+                    let db = 20.0 * (hold + 1e-9).log10();
                     shared.level_milli_db.store((-db * 1000.0).max(0.0) as u32, Ordering::Relaxed);
+                    if clipped > 0 {
+                        shared.clipped.fetch_add(clipped, Ordering::Relaxed);
+                        clip_periods = clip_hold_periods;
+                    } else {
+                        clip_periods = clip_periods.saturating_sub(1);
+                    }
+                    shared.clipping.store(clip_periods > 0, Ordering::Relaxed);
                     // the key detector gets a copy of its channel; nothing else here
                     if let Some(kh) = &key_handle {
                         let src: &[f32] = if key_ch == mic {
@@ -585,6 +612,7 @@ fn main() -> Result<()> {
                             tracker: **live.tracker_grid.load(),
                             tempo_strength: shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
                             level_db: level,
+                            clipping: shared.clipping.load(Ordering::Relaxed),
                             xruns: shared.xruns.load(Ordering::Relaxed),
                             ticks: stats.ticks.load(Ordering::Relaxed),
                             midi: midi_on,
@@ -687,8 +715,10 @@ fn main() -> Result<()> {
             Some(e) => format!("{} {:.2}", e.short_name(), e.confidence),
             None => "--".to_string(),
         };
+        let clipped = shared.clipped.load(Ordering::Relaxed);
+        let clip = if clipped > 0 { format!("  CLIP {clipped}") } else { String::new() };
         let line = format!(
-            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  in {level:5.1} dBFS  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
+            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
             g.bpm(),
             g.confidence,
             shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,

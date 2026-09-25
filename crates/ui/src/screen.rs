@@ -43,6 +43,8 @@ pub struct Status {
     pub tracker: Grid,
     pub tempo_strength: f32,
     pub level_db: f32,
+    /// The input hit full scale within the last second or so.
+    pub clipping: bool,
     pub xruns: u64,
     pub ticks: u64,
     pub midi: bool,
@@ -645,6 +647,7 @@ pub struct View {
     lamp: Option<u32>,
     bar_len: u32,
     level_pct: u32,
+    clipping: bool,
     xruns: u64,
     stats: String,
     running: bool,
@@ -745,6 +748,7 @@ impl View {
             lamp,
             bar_len: live.bar_len.max(1),
             level_pct,
+            clipping: page == Page::Tempo && s.clipping,
             xruns: s.xruns,
             stats,
             running: live.running,
@@ -1291,7 +1295,11 @@ impl Screen {
                 if filled > 0 {
                     let _ = c.fill_solid(&Rectangle::new(Point::new(meter_x, cy - meter_h / 2), Size::new(filled as u32, meter_h as u32)), lc);
                 }
-                self.text(c, "IN", Point::new(meter_x - m, cy), s, DIM, Alignment::Right);
+                if v.clipping {
+                    self.text(c, "CLIP", Point::new(meter_x - m, cy), s, RED, Alignment::Right);
+                } else {
+                    self.text(c, "IN", Point::new(meter_x - m, cy), s, DIM, Alignment::Right);
+                }
                 if v.xruns > 0 {
                     self.text(c, &format!("XRUNS {}", v.xruns), Point::new(meter_x - m - (30 * s) as i32, cy), s, RED, Alignment::Right);
                 }
@@ -1777,6 +1785,7 @@ mod tests {
             tracker: Grid { running: true, t0: 100.0, n0: 0, period: 0.5, state: State::Running, confidence: 0.8, ..Grid::default() },
             tempo_strength: 0.4,
             level_db: -18.0,
+            clipping: false,
             xruns: 0,
             ticks: 12345,
             midi: true,
