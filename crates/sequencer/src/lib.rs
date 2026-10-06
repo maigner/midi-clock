@@ -1506,6 +1506,12 @@ fn strike(midi: &dyn NoteOut, stats: &SeqStats, pending: &mut Vec<Pending>, vel:
     }
 }
 
+/// A 16th the grid moved into the past (a phase correction pulled the beat
+/// earlier while the sequencer was waiting for it) is still played, up to
+/// this late, or half a step if that is less. Later than that the grid
+/// really jumped (a relock) and the step is skipped.
+const CATCH_UP_S: f64 = 0.06;
+
 /// The sequencer thread body. Runs until `stop` is set.
 pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
     mut get_grid: G,
@@ -1600,6 +1606,15 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
             if a > la + 2 * STEPS as i64 {
                 // The grid jumped far ahead; do not burst.
                 last_a = None;
+            } else if a > la + 1 {
+                // The 16th after the last one played is already behind us:
+                // a correction moved the grid earlier. Play it late rather
+                // than drop it, unless it is too far gone.
+                let m = la + 1;
+                let t_missed = g.tick_time(m.div_euclid(4), (m.rem_euclid(4) * 6) as u32) - lead_s;
+                if tnow - t_missed <= CATCH_UP_S.min(step_len * 0.5) {
+                    a = m;
+                }
             }
         }
         let n = a.div_euclid(4);
@@ -2028,6 +2043,38 @@ mod tests {
         for (i, t) in ons.iter().enumerate() {
             assert!((t - i as f64 * 0.25).abs() < 0.003, "beat {i}: {t}");
         }
+    }
+
+    #[test]
+    fn a_phase_correction_backwards_does_not_drop_a_step() {
+        // Bass on every beat at 240 BPM. 10 ms before beat 1 the grid is
+        // pulled 30 ms earlier (a tracker phase correction), so beat 1 is
+        // suddenly 20 ms in the past: it must still be played, a little
+        // late, not skipped.
+        let mut st = SeqState::default();
+        for k in [0, 4, 8, 12] {
+            st.apply(SeqAction::BassSet(0, k));
+        }
+        let snap = std::sync::Arc::new(st.snapshot());
+        let t0 = now() + 0.05;
+        let base = Grid { running: true, epoch: 1, t0, n0: 0, period: 0.25, ..Grid::default() };
+        let get_grid = || if now() >= t0 + 0.24 { Grid { t0: t0 - 0.03, ..base } } else { base };
+        let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+        let stop = AtomicBool::new(false);
+        let stats = SeqStats::default();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sleep_until(t0 + 0.9);
+                stop.store(true, Ordering::Relaxed);
+            });
+            run(get_grid, || snap.clone(), &rec, 0.0, &stop, &stats);
+        });
+        let ev = rec.0.into_inner().unwrap();
+        let ons: Vec<f64> = ev.iter().filter(|e| e.1).map(|e| e.0 - t0).collect();
+        // beats 0, 1 (late), 2, 3 on the shifted grid
+        assert_eq!(ons.len(), 4, "{ons:?}");
+        assert!((ons[1] - 0.24).abs() < 0.004, "beat 1 should play right after the shift: {ons:?}");
+        assert!((ons[2] - 0.47).abs() < 0.004 && (ons[3] - 0.72).abs() < 0.004, "{ons:?}");
     }
 
     #[test]

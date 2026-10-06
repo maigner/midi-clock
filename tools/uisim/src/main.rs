@@ -305,6 +305,7 @@ fn main() -> Result<()> {
                 tempo_strength: tracker.last_tempo_strength as f32,
                 level_db: level,
                 clipping: false,
+                peak_db: level,
                 xruns: 0,
                 ticks,
                 midi: true,

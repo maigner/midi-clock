@@ -80,6 +80,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
         tempo_strength: 0.41,
         level_db: -18.0,
         clipping: false,
+        peak_db: -18.0,
         xruns: 0,
         ticks: 12345,
         midi: true,
@@ -187,6 +188,8 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
 const CLIP_LEVEL: f32 = 0.98;
 /// The level meter and the clip flag hold for this long.
 const LEVEL_HOLD_S: f64 = 1.5;
+/// The gain hint on the TEMPO page judges the loudest moment of this long.
+const GAIN_HOLD_S: f64 = 8.0;
 
 /// One hop of analysis, audio thread -> tracker thread.
 #[derive(Clone, Copy)]
@@ -202,6 +205,8 @@ struct Shared {
     stop: AtomicBool,
     xruns: AtomicU64,
     level_milli_db: AtomicU32, // input peak level in dB * -1000 (u32), held for ~1.5 s
+    /// Input peak level in dB * -1000, held for ~8 s (drives the gain hint).
+    peak_slow_milli_db: AtomicU32,
     /// Input samples at or above `CLIP_LEVEL` so far.
     clipped: AtomicU64,
     /// The input clipped within the last ~1.5 s.
@@ -284,6 +289,7 @@ fn main() -> Result<()> {
 
     let shared = Arc::new(Shared::default());
     shared.level_milli_db.store(120_000, Ordering::Relaxed); // -120 dB until audio reports
+    shared.peak_slow_milli_db.store(120_000, Ordering::Relaxed);
     let live = Arc::new(Live::new(start_mode));
     let mut manual = ManualClock::new(cfg.manual(), cfg.ui.manual_bpm);
     if start_mode == Mode::Manual {
@@ -475,6 +481,8 @@ fn main() -> Result<()> {
                 let hold_decay = (-(period as f64 / fs) / LEVEL_HOLD_S).exp() as f32;
                 let clip_hold_periods = (LEVEL_HOLD_S * fs / period as f64) as u32;
                 let mut clip_periods = 0u32;
+                let mut hold_slow = 0f32;
+                let slow_decay = (-(period as f64 / fs) / GAIN_HOLD_S).exp() as f32;
                 if let Err(e) = duplex.start() {
                     eprintln!("audio start failed: {e:#}");
                     shared.audio_error.store(true, Ordering::Relaxed);
@@ -502,6 +510,9 @@ fn main() -> Result<()> {
                     hold = if peak >= hold { peak } else { hold * hold_decay };
                     let db = 20.0 * (hold + 1e-9).log10();
                     shared.level_milli_db.store((-db * 1000.0).max(0.0) as u32, Ordering::Relaxed);
+                    hold_slow = if peak >= hold_slow { peak } else { hold_slow * slow_decay };
+                    let db_slow = 20.0 * (hold_slow + 1e-9).log10();
+                    shared.peak_slow_milli_db.store((-db_slow * 1000.0).max(0.0) as u32, Ordering::Relaxed);
                     if clipped > 0 {
                         shared.clipped.fetch_add(clipped, Ordering::Relaxed);
                         clip_periods = clip_hold_periods;
@@ -613,6 +624,7 @@ fn main() -> Result<()> {
                             tempo_strength: shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
                             level_db: level,
                             clipping: shared.clipping.load(Ordering::Relaxed),
+                            peak_db: -(shared.peak_slow_milli_db.load(Ordering::Relaxed) as f32) / 1000.0,
                             xruns: shared.xruns.load(Ordering::Relaxed),
                             ticks: stats.ticks.load(Ordering::Relaxed),
                             midi: midi_on,

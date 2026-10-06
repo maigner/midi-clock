@@ -45,6 +45,8 @@ pub struct Status {
     pub level_db: f32,
     /// The input hit full scale within the last second or so.
     pub clipping: bool,
+    /// Loudest input moment of the last ~8 s (dBFS): what the gain hint judges.
+    pub peak_db: f32,
     pub xruns: u64,
     pub ticks: u64,
     pub midi: bool,
@@ -634,6 +636,28 @@ fn shown_bar(picked: usize, locked: bool, play: Option<(usize, usize)>) -> usize
     }
 }
 
+/// Held peaks below this ask for more gain at the mic pre, above
+/// `GAIN_HIGH_DB` for less; between them the onset detector is happy and
+/// the band's loudest hits still leave headroom before the converter clips.
+const GAIN_LOW_DB: f32 = -26.0;
+const GAIN_HIGH_DB: f32 = -8.0;
+/// Below this the input is silence and no advice makes sense.
+const GAIN_SILENT_DB: f32 = -50.0;
+
+/// What the player should do with the mic pre, judged from the loudest
+/// moment of the last few seconds; nothing while there is no input.
+fn gain_hint(s: &Status) -> Option<(&'static str, Rgb888)> {
+    if s.clipping || s.peak_db > GAIN_HIGH_DB {
+        Some(("GAIN DOWN", RED))
+    } else if s.level_db < GAIN_SILENT_DB {
+        None
+    } else if s.peak_db < GAIN_LOW_DB {
+        Some(("GAIN UP", YELLOW))
+    } else {
+        Some(("GAIN OK", GREEN))
+    }
+}
+
 /// What actually gets drawn, quantised so equal views mean "no redraw needed".
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
@@ -648,6 +672,8 @@ pub struct View {
     bar_len: u32,
     level_pct: u32,
     clipping: bool,
+    /// Caption under the meter telling the player how to set the mic pre.
+    gain: Option<(&'static str, Rgb888)>,
     xruns: u64,
     stats: String,
     running: bool,
@@ -749,6 +775,7 @@ impl View {
             bar_len: live.bar_len.max(1),
             level_pct,
             clipping: page == Page::Tempo && s.clipping,
+            gain: if page == Page::Tempo { gain_hint(s) } else { None },
             xruns: s.xruns,
             stats,
             running: live.running,
@@ -1295,6 +1322,15 @@ impl Screen {
                 if filled > 0 {
                     let _ = c.fill_solid(&Rectangle::new(Point::new(meter_x, cy - meter_h / 2), Size::new(filled as u32, meter_h as u32)), lc);
                 }
+                // Ticks at the edges of the good zone for the mic pre gain.
+                for db in [GAIN_LOW_DB, GAIN_HIGH_DB] {
+                    let x = meter_x + (meter_w as f32 * (db + 60.0) / 60.0) as i32;
+                    let _ = c.fill_solid(&Rectangle::new(Point::new(x, cy - meter_h / 2), Size::new(2, meter_h as u32)), TEXT);
+                }
+                if let Some((hint, col)) = v.gain {
+                    let hy = cy + meter_h / 2 + m / 2 + (5 * s) as i32;
+                    self.text(c, hint, Point::new(w - m, hy), s, col, Alignment::Right);
+                }
                 if v.clipping {
                     self.text(c, "CLIP", Point::new(meter_x - m, cy), s, RED, Alignment::Right);
                 } else {
@@ -1786,6 +1822,7 @@ mod tests {
             tempo_strength: 0.4,
             level_db: -18.0,
             clipping: false,
+            peak_db: -18.0,
             xruns: 0,
             ticks: 12345,
             midi: true,
