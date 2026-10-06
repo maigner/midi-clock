@@ -381,6 +381,15 @@ fn apply(
             manual.tap(t);
             *live = manual.grid();
         }
+        Action::SetOne(t) => {
+            if *mode == Mode::Manual {
+                if manual.set_one(t) {
+                    *live = manual.grid();
+                }
+            } else if tracker.set_downbeat(t) {
+                *live = tracker.grid();
+            }
+        }
         Action::Nudge(d) => {
             manual.nudge_bpm(d, now);
             *live = manual.grid();

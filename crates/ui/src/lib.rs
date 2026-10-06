@@ -51,6 +51,9 @@ pub enum Action {
     SetMode(Mode),
     /// Tap at this monotonic time (touch latency already subtracted).
     Tap(f64),
+    /// The beat nearest this monotonic time (touch latency already
+    /// subtracted) is beat one of its bar.
+    SetOne(f64),
     /// Change the manual tempo by this many BPM.
     Nudge(f64),
     ToggleRun,
@@ -472,6 +475,7 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::Minus5 => Action::Nudge(-5.0),
         Button::Minus1 => Action::Nudge(-1.0),
         Button::Tap => Action::Tap(t),
+        Button::One => Action::SetOne(t),
         Button::Plus1 => Action::Nudge(1.0),
         Button::Plus5 => Action::Nudge(5.0),
         Button::StartStop => Action::ToggleRun,

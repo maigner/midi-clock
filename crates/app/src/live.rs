@@ -3,7 +3,7 @@
 //! the mode keeps a mode switch from racing with a tracker publish. The lock
 //! is held only for one pointer store.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -19,6 +19,9 @@ pub struct Live {
     pub tracker_grid: ArcSwap<Grid>,
     /// Tracker thread: take over the live grid on the next hop.
     pub adopt: AtomicBool,
+    /// Tracker thread: the beat nearest this monotonic time (as f64 bits,
+    /// 0 = nothing pending) is beat one. Set by the ONE button in auto mode.
+    pub set_one: AtomicU64,
 }
 
 impl Live {
@@ -29,6 +32,7 @@ impl Live {
             grid: ArcSwap::from_pointee(Grid::default()),
             tracker_grid: ArcSwap::from_pointee(Grid::default()),
             adopt: AtomicBool::new(false),
+            set_one: AtomicU64::new(0),
         }
     }
 

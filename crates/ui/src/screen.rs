@@ -97,6 +97,8 @@ pub enum Button {
     Plus1,
     Plus5,
     StartStop,
+    /// Pressed on the first beat of a bar: that beat is the one.
+    One,
     // Key page
     KeyAuto,
     KeyManual,
@@ -180,9 +182,15 @@ impl Button {
     fn page(self) -> Option<Page> {
         match self {
             Button::PageTempo | Button::PageKey | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => None,
-            Button::ModeAuto | Button::ModeManual | Button::Minus5 | Button::Minus1 | Button::Tap | Button::Plus1 | Button::Plus5 | Button::StartStop => {
-                Some(Page::Tempo)
-            }
+            Button::ModeAuto
+            | Button::ModeManual
+            | Button::Minus5
+            | Button::Minus1
+            | Button::Tap
+            | Button::Plus1
+            | Button::Plus5
+            | Button::StartStop
+            | Button::One => Some(Page::Tempo),
             Button::KeyAuto | Button::KeyManual | Button::KeyRoot(_) | Button::KeyScale(_) => Some(Page::Key),
             Button::Generate(Instrument::Lead, _) => Some(Page::Lead),
             Button::Generate(Instrument::Bass, _) => Some(Page::Bass),
@@ -677,6 +685,8 @@ pub struct View {
     xruns: u64,
     stats: String,
     running: bool,
+    /// The one is known (set by hand or proven), so the ONE button is lit.
+    one_known: bool,
     /// The KEY page is on AUTO (its hand-set controls are hidden).
     key_auto: bool,
     /// A key is known (the generators work).
@@ -779,6 +789,7 @@ impl View {
             xruns: s.xruns,
             stats,
             running: live.running,
+            one_known: live.downbeat_known,
             key_auto: s.seq.key.auto,
             key_known: effective_key(&s.seq.key, s.key.as_ref()).is_some(),
             pressed,
@@ -879,6 +890,9 @@ impl Screen {
         let unit = (w - 7 * m) / 6;
         let ya = (h as f64 * 0.66) as i32;
         let ha = (h as f64 * 0.15) as i32;
+        // ONE under the mode buttons, above the tap row.
+        let one_y = y1 + 2 * (mode_h + m);
+        buttons.push((Button::One, rect(m, one_y, mode_w, ya - m - one_y)));
         let mut x = m;
         for (b, units) in [(Button::Minus5, 1), (Button::Minus1, 1), (Button::Tap, 2), (Button::Plus1, 1), (Button::Plus5, 1)] {
             let bw = unit * units + m * (units - 1);
@@ -1229,6 +1243,7 @@ impl Screen {
                 Button::Plus1 => ("+1".into(), None),
                 Button::Plus5 => ("+5".into(), None),
                 Button::StartStop => (if v.running { "STOP" } else { "START" }.into(), None),
+                Button::One => ("ONE".into(), v.one_known.then_some(if v.mode == Mode::Auto { AUTO } else { MANUAL })),
                 Button::KeyAuto => ("AUTO".into(), (v.key_auto).then_some(AUTO)),
                 Button::KeyManual => ("MANUAL".into(), (!v.key_auto).then_some(MANUAL)),
                 Button::KeyRoot(pc) => (PITCH_NAMES[*pc as usize].into(), key.and_then(|q| q.key).filter(|k| k.root == *pc).map(|_| MANUAL)),

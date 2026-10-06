@@ -388,6 +388,10 @@ fn main() -> Result<()> {
                         tr.adopt(**live.grid.load(), rtio::now());
                         live.publish_tracker(tr.grid());
                     }
+                    let one = live.set_one.swap(0, Ordering::Relaxed);
+                    if one != 0 && tr.set_downbeat(f64::from_bits(one)) {
+                        live.publish_tracker(tr.grid());
+                    }
                     let mut any = false;
                     while let Some(m) = cons.try_pop() {
                         any = true;
@@ -655,6 +659,14 @@ fn main() -> Result<()> {
                                 manual.tap(t);
                                 live.publish_manual(manual.grid());
                             }
+                            Action::SetOne(t) => match live.mode() {
+                                Mode::Manual => {
+                                    if manual.set_one(t) {
+                                        live.publish_manual(manual.grid());
+                                    }
+                                }
+                                Mode::Auto => live.set_one.store(t.to_bits(), Ordering::Relaxed),
+                            },
                             Action::Nudge(d) => {
                                 manual.nudge_bpm(d, now);
                                 live.publish_manual(manual.grid());

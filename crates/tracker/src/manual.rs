@@ -141,6 +141,18 @@ impl ManualClock {
         self.grid.confidence = 1.0;
     }
 
+    /// The beat nearest to `t` is beat one of its bar (the ONE button).
+    /// Nothing happens while the clock is not running.
+    pub fn set_one(&mut self, t: f64) -> bool {
+        if !self.grid.running {
+            return false;
+        }
+        let (n, _) = self.grid.nearest_beat(t);
+        self.grid.downbeat = n.rem_euclid(self.grid.bar_len.max(1) as i64) as u32;
+        self.grid.downbeat_known = true;
+        true
+    }
+
     /// Start the clock at the current tempo, first beat after `start_delay_s`.
     pub fn start(&mut self, now: f64) {
         if self.grid.running {

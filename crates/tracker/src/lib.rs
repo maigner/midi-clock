@@ -115,6 +115,10 @@ pub struct Tracker {
     /// `accumulate_downbeat`), and that phase.
     downbeat_streak: u32,
     downbeat_last: u32,
+    /// The one was set by hand (`set_downbeat`) or carried over from a
+    /// grid that knew it: the kick pattern no longer gets a say until the
+    /// clock starts afresh.
+    downbeat_pinned: bool,
     est: tempo::Estimator,
     /// Diagnostics.
     pub last_tempo_strength: f64,
@@ -145,6 +149,7 @@ impl Tracker {
             beat_kick: VecDeque::new(),
             downbeat_streak: 0,
             downbeat_last: 0,
+            downbeat_pinned: false,
             est,
             last_tempo_strength: 0.0,
             corrections: 0,
@@ -177,7 +182,24 @@ impl Tracker {
         self.last_est_hop = self.hops;
         self.est_history.clear();
         self.beat_kick.clear();
+        self.downbeat_pinned = g.downbeat_known;
         self.forget_downbeat();
+    }
+
+    /// The beat nearest to `t` is beat one of its bar, by the player's
+    /// word: the sequencers' bars and the accent click move there, and the
+    /// kick pattern stops guessing until the clock starts afresh. Nothing
+    /// happens while the clock is not running.
+    pub fn set_downbeat(&mut self, t: f64) -> bool {
+        if !self.grid.running {
+            return false;
+        }
+        let (n, _) = self.grid.nearest_beat(t);
+        self.grid.downbeat = n.rem_euclid(self.grid.bar_len.max(1) as i64) as u32;
+        self.grid.downbeat_known = true;
+        self.downbeat_pinned = true;
+        self.downbeat_streak = 0;
+        true
     }
 
     /// Throw away the tempo estimate and lock again from the ODF history. The
@@ -288,6 +310,7 @@ impl Tracker {
             self.grid.downbeat = 0;
             self.next_eval_beat = 0;
             self.beat_kick.clear();
+            self.downbeat_pinned = false;
             self.forget_downbeat();
         }
         self.grid.confidence = 0.5;
@@ -409,6 +432,9 @@ impl Tracker {
         while self.beat_kick.len() > 16 {
             self.beat_kick.pop_front();
         }
+        if self.downbeat_pinned {
+            return;
+        }
         let bar = self.grid.bar_len;
         if bar < 2 || self.beat_kick.len() < 2 * bar as usize {
             return;
@@ -430,7 +456,7 @@ impl Tracker {
     }
 
     fn forget_downbeat(&mut self) {
-        self.grid.downbeat_known = false;
+        self.grid.downbeat_known = self.downbeat_pinned;
         self.downbeat_streak = 0;
     }
 }
@@ -525,6 +551,51 @@ mod tests {
         let accented: Vec<i64> = (0..8).map(|n| n as i64).filter(|&n| g.accent(n)).collect();
         assert_eq!(accented.len(), 2, "one accent per 4 beats: {accented:?}");
         assert_eq!(accented[1] - accented[0], 4);
+    }
+
+    #[test]
+    fn the_player_can_name_the_one_and_the_kicks_do_not_overrule_it() {
+        // Kick on beat 1 of 4 would make the tracker pick that beat; the
+        // player says the one is the beat before it, and that sticks.
+        let cfg = TrackerConfig::default();
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let period = 0.5;
+        let mut next_beat = 0.5;
+        let mut beat = 0usize;
+        let mut named: Option<(i64, u32)> = None;
+        let hops = (30.0 / dt) as u64;
+        for i in 0..hops {
+            let t = (i + 1) as f64 * dt;
+            let (mut odf, mut k, mut onset) = (0.3, 0.1, None);
+            if t >= next_beat && t - dt < next_beat {
+                odf = 8.0;
+                k = if beat % 4 == 1 { 8.0 } else { 1.0 };
+                onset = Some((next_beat, 8.0));
+                next_beat += period;
+                beat += 1;
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: k, onset });
+            if named.is_none() && t > 12.0 && tr.grid().running {
+                // name the beat that just passed, which has kick 1.0 if
+                // the kick pattern's favourite is the next one
+                let (n, _) = tr.grid().nearest_beat(t - 0.1);
+                let want = ((n - 1).rem_euclid(4)) as u32;
+                assert!(tr.set_downbeat(tr.grid().beat_time(n - 1)));
+                named = Some((n - 1, want));
+                assert_eq!(tr.grid().downbeat, want);
+                assert!(tr.grid().downbeat_known);
+            }
+        }
+        let (_, want) = named.expect("clock never ran");
+        let g = tr.grid();
+        assert!(g.running && g.downbeat_known, "{g:?}");
+        assert_eq!(g.downbeat, want, "the kicks overruled the player");
+        // a grid adopted with a known one keeps it too
+        let mut tr2 = Tracker::new(TrackerConfig::default());
+        tr2.adopt(g, 30.0);
+        assert!(tr2.grid().downbeat_known && tr2.grid().downbeat == want);
+        assert!(!Tracker::new(TrackerConfig::default()).set_downbeat(1.0), "nothing to name while stopped");
     }
 
     #[test]
