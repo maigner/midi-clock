@@ -506,6 +506,8 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::DrumStep(k) => Action::Seq(SeqAction::DrumStep(k)),
         Button::ChannelMinus(i) => Action::Seq(SeqAction::Channel(i, -1)),
         Button::ChannelPlus(i) => Action::Seq(SeqAction::Channel(i, 1)),
+        Button::NoteLeadMinus => Action::Seq(SeqAction::NoteLead(-1)),
+        Button::NoteLeadPlus => Action::Seq(SeqAction::NoteLead(1)),
     };
     act(a);
 }

@@ -120,6 +120,20 @@ pub struct Tracker {
     /// clock starts afresh.
     downbeat_pinned: bool,
     est: tempo::Estimator,
+    /// Running mean and variance of the accepted onsets' timing errors, as
+    /// fractions of the period. A played pulse has a small spread even when
+    /// it lags the grid; a synth's smeared or random onsets a large one, and
+    /// then the tracker holds its tempo (`hold`).
+    err_mean: f64,
+    err_var: f64,
+    /// The spread is high: the tempo is held (with hysteresis, see
+    /// `SPREAD_HOLD` / `SPREAD_RELEASE`).
+    hold: bool,
+    /// Tempo strength the pulse had while it was one (EMA): a held tempo
+    /// is only moved by evidence of comparable strength.
+    lock_strength: f64,
+    /// Beat that got a hit inside `TIGHT_WINDOW`.
+    tight_beat: i64,
     /// Diagnostics.
     pub last_tempo_strength: f64,
     pub corrections: u64,
@@ -150,6 +164,11 @@ impl Tracker {
             downbeat_streak: 0,
             downbeat_last: 0,
             downbeat_pinned: false,
+            err_mean: 0.0,
+            err_var: 0.0,
+            hold: false,
+            lock_strength: 0.0,
+            tight_beat: i64::MIN,
             est,
             last_tempo_strength: 0.0,
             corrections: 0,
@@ -176,6 +195,11 @@ impl Tracker {
         self.grid.confidence = if g.running { 0.3 } else { 0.0 };
         self.next_eval_beat = if g.running { self.grid.first_beat_at_or_after(now) } else { 0 };
         self.hit_beat = i64::MIN;
+        self.tight_beat = i64::MIN;
+        self.err_mean = 0.0;
+        self.err_var = 0.0;
+        self.hold = false;
+        self.lock_strength = self.cfg.min_tempo_strength;
         self.misses = 0;
         self.disagree = 0;
         self.last_onset_time = now;
@@ -200,6 +224,24 @@ impl Tracker {
         self.downbeat_pinned = true;
         self.downbeat_streak = 0;
         true
+    }
+
+    /// Mean timing of the accepted onsets against the beats, in seconds:
+    /// positive = the onsets come after the beats, so the grid (click,
+    /// notes) runs early; negative = late.
+    pub fn onset_bias_s(&self) -> f64 {
+        self.err_mean * self.grid.period
+    }
+
+    /// The tempo is held because the onsets are no pulse (see `hold`).
+    pub fn holding(&self) -> bool {
+        self.hold
+    }
+
+    /// Spread of the accepted onsets' timing errors (standard deviation as
+    /// a fraction of the period), what `holding` is judged from.
+    pub fn onset_spread(&self) -> f64 {
+        self.err_var.sqrt()
     }
 
     /// Throw away the tempo estimate and lock again from the ODF history. The
@@ -267,15 +309,18 @@ impl Tracker {
             return;
         };
         self.last_tempo_strength = strength;
-        if strength < self.cfg.min_tempo_strength {
+        if strength < self.needed_strength() {
             return;
         }
         self.est_history.push(p);
         let n = self.est_history.len();
-        if n < self.cfg.lock_estimates {
+        // A held clock is only moved by a longer run of agreeing estimates
+        // than a fresh lock needs.
+        let needed = if self.grid.running && self.hold { 2 * self.cfg.lock_estimates } else { self.cfg.lock_estimates };
+        if n < needed {
             return;
         }
-        let recent = &self.est_history[n - self.cfg.lock_estimates..];
+        let recent = &self.est_history[n - needed..];
         let mean = recent.iter().sum::<f64>() / recent.len() as f64;
         if recent.iter().any(|&x| (x / mean - 1.0).abs() > 0.04) {
             return;
@@ -312,10 +357,18 @@ impl Tracker {
             self.beat_kick.clear();
             self.downbeat_pinned = false;
             self.forget_downbeat();
+            // A fresh lock trusts its onsets until they prove otherwise; a
+            // hot relock inherits the spread, so a held tempo stays held
+            // until the onsets are a pulse again.
+            self.err_mean = 0.0;
+            self.err_var = 0.0;
+            self.hold = false;
         }
+        self.lock_strength = strength;
         self.grid.confidence = 0.5;
         self.grid.state = State::Running;
         self.hit_beat = i64::MIN;
+        self.tight_beat = i64::MIN;
         self.misses = 0;
         self.disagree = 0;
         self.est_history.clear();
@@ -323,14 +376,34 @@ impl Tracker {
 
     fn step_running(&mut self, inp: &HopInput) {
         let p = self.grid.period;
+        // The onsets around are not a pulse (a synth, a break, talking):
+        // hold what we have. The period is frozen (its onset term damped),
+        // and a relock takes a longer run of stronger agreeing estimates.
+        let hold = self.hold;
         // 1. Phase-locked loop on onsets.
         if let Some((t_on, strength)) = inp.onset {
             let (n, err) = self.grid.nearest_beat(t_on);
             if err.abs() <= self.cfg.accept_window * p && n >= self.next_eval_beat - 1 {
+                if err.abs() <= TIGHT_WINDOW * p {
+                    self.tight_beat = n;
+                }
+                let e = err / p;
+                self.err_mean += SPREAD_ALPHA * (e - self.err_mean);
+                let d = e - self.err_mean;
+                self.err_var += SPREAD_ALPHA * (d * d - self.err_var);
+                let spread = self.err_var.sqrt();
+                if spread > SPREAD_HOLD {
+                    self.hold = true;
+                } else if spread < SPREAD_RELEASE {
+                    self.hold = false;
+                }
                 let w = (strength as f64 / self.cfg.full_weight_strength).clamp(0.15, 1.0);
                 let max_slew = self.cfg.max_phase_slew * p;
                 let dphase = (self.cfg.kp * err * w).clamp(-max_slew, max_slew);
-                let dperiod = (self.cfg.ki * err * w).clamp(-0.02 * p, 0.02 * p);
+                // Holding damps only the period: the phase still follows
+                // every onset, so a band that trips the hold is not lagged.
+                let wp = if hold { w * HOLD_PERIOD } else { w };
+                let dperiod = (self.cfg.ki * err * wp).clamp(-0.02 * p, 0.02 * p);
                 self.grid.t0 += dphase;
                 // Hits may pull the period, but never out of the configured tempo window.
                 self.grid.period = (self.grid.period + dperiod).clamp(60.0 / self.cfg.bpm_max, 60.0 / self.cfg.bpm_min);
@@ -346,7 +419,10 @@ impl Tracker {
         while self.grid.beat_time(self.next_eval_beat) + self.cfg.accept_window * self.grid.period < inp.time {
             let n = self.next_eval_beat;
             let hit = self.hit_beat == n;
-            self.grid.confidence = (self.grid.confidence * 0.85 + if hit { 0.15 } else { 0.0 }).clamp(0.0, 1.0);
+            let tight = self.tight_beat == n;
+            // A loose hit is worth half: sloppy onsets never show full confidence.
+            let gain = if tight { 0.15 } else if hit { 0.075 } else { 0.0 };
+            self.grid.confidence = (self.grid.confidence * 0.85 + gain).clamp(0.0, 1.0);
             if hit {
                 self.misses = 0;
             } else {
@@ -372,9 +448,19 @@ impl Tracker {
             let cur = self.grid.period / self.cfg.hop_dt;
             if let Some((p_est, strength)) = self.estimate_period(Some(cur)) {
                 self.last_tempo_strength = strength;
-                if strength >= self.cfg.min_tempo_strength {
+                if strength >= self.needed_strength() {
+                    if !hold {
+                        self.lock_strength += 0.1 * (strength - self.lock_strength);
+                    }
                     let ratio = p_est / cur;
-                    if (ratio - 1.0).abs() < 0.15 {
+                    // Coasting with a confident estimate: the beats are
+                    // being missed although there is a pulse, so the phase
+                    // is off. Agreeing on the period alone does not help;
+                    // relock to place the beats again.
+                    let agree = (ratio - 1.0).abs() < 0.15 && self.grid.state != State::Coasting;
+                    if agree && hold {
+                        // Frozen: the period is not blended towards onsets that are no pulse.
+                    } else if agree {
                         let new_p = self.grid.period + self.cfg.period_blend * (p_est * self.cfg.hop_dt - self.grid.period);
                         // Re-anchor at the most recent beat so the change does not move past beats.
                         let (n_ref, _) = self.grid.nearest_beat(inp.time);
@@ -407,6 +493,18 @@ impl Tracker {
             current,
             self.cfg.tempo_hysteresis,
         )
+    }
+
+    /// Tempo strength an estimate needs to count. A held tempo asks for a
+    /// good part of what the pulse had: the comb score of onsets that are
+    /// no pulse sits just above `min_tempo_strength`, a played pulse well
+    /// above it.
+    fn needed_strength(&self) -> f64 {
+        if self.grid.running && self.hold {
+            self.cfg.min_tempo_strength.max(HOLD_STRENGTH * self.lock_strength)
+        } else {
+            self.cfg.min_tempo_strength
+        }
     }
 
     /// Kick energy around beat `n` goes into a 16-beat history. `downbeat`
@@ -476,6 +574,23 @@ fn phase_margin(hist: &VecDeque<(i64, f32)>, bar: u32) -> (u32, f32) {
 
 /// Kick on the winning beat has to exceed the runner-up by this factor.
 const DOWNBEAT_MARGIN: f32 = 1.3;
+/// A hit this close to its beat (fraction of the period) counts fully for
+/// the confidence; a looser one within the accept window counts half.
+const TIGHT_WINDOW: f64 = 0.08;
+/// Per-onset weight of the error mean and variance (about four onsets).
+const SPREAD_ALPHA: f64 = 0.25;
+/// Standard deviation of the onset errors (fraction of the period) above
+/// which they are no pulse and the tempo is held: a drummer spreads
+/// 0.01-0.04, onsets at random over the accept window 0.05-0.1 (the phase
+/// loop keeps chasing them, which narrows the measured spread).
+const SPREAD_HOLD: f64 = 0.07;
+/// The hold is released below this spread.
+const SPREAD_RELEASE: f64 = 0.045;
+/// Weight of the onsets' period correction while holding.
+const HOLD_PERIOD: f64 = 0.25;
+/// Fraction of the pulse's tempo strength an estimate needs to move a
+/// held tempo.
+const HOLD_STRENGTH: f64 = 0.6;
 /// The other meter the kick pattern is checked against.
 const ALT_BAR_LEN: u32 = 3;
 
@@ -645,6 +760,66 @@ mod tests {
                 assert!(g.bpm() >= 100.0 - 1e-6 && g.bpm() <= 140.0 + 1e-6, "bpm {} left the window at {t}s", g.bpm());
             }
         }
+    }
+
+    /// A clean pulse at `bpm` for `pulse_s`, then `noise_s` of random onsets
+    /// (a synth without the drums), then the pulse again. Returns the grid
+    /// after the noise and the worst beat error over the last 3 s.
+    fn pulse_noise_pulse(bpm: f64, pulse_s: f64, noise_s: f64) -> (Grid, f64) {
+        let cfg = TrackerConfig::default();
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let period = 60.0 / bpm;
+        let mut next_beat = 0.5;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut next_noise = pulse_s + rnd() * 0.5;
+        let total = pulse_s + noise_s + 10.0;
+        let hops = (total / dt) as u64;
+        let mut after_noise = None;
+        let mut worst = 0.0f64;
+        for i in 0..hops {
+            let t = (i + 1) as f64 * dt;
+            let (mut odf, mut onset) = (0.3, None);
+            let in_noise = t >= pulse_s && t < pulse_s + noise_s;
+            if t >= next_beat && t - dt < next_beat {
+                if !in_noise {
+                    odf = 8.0;
+                    onset = Some((next_beat, 8.0));
+                }
+                next_beat += period;
+            }
+            if in_noise && t >= next_noise {
+                odf = 3.0;
+                onset = Some((t, 3.0));
+                next_noise = t + 0.1 + rnd() * 0.5; // about 3 a second
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: odf, onset });
+            if std::env::var("TRACE").is_ok() && i % (1.0 / dt) as u64 == 0 {
+                eprintln!("t {t:5.1} bpm {:6.2} {:?} hold {} spread {:.3} relocks {} disagree {} str {:.2} lock {:.2}", tr.grid().bpm(), tr.grid().state, tr.hold, tr.err_var.sqrt(), tr.relocks, tr.disagree, tr.last_tempo_strength, tr.lock_strength);
+            }
+            if t >= pulse_s + noise_s && after_noise.is_none() {
+                after_noise = Some(tr.grid());
+            }
+            if t > total - 3.0 && tr.grid().running {
+                let (_, err) = tr.grid().nearest_beat(next_beat - period);
+                worst = worst.max(err.abs());
+            }
+        }
+        (after_noise.expect("ran"), worst)
+    }
+
+    #[test]
+    fn holds_the_tempo_through_a_synth_only_passage() {
+        let (g, worst) = pulse_noise_pulse(100.0, 12.0, 25.0);
+        assert!(g.running, "stopped during the synth passage");
+        assert!((g.bpm() - 100.0).abs() < 3.0, "tempo drifted to {} bpm on random onsets", g.bpm());
+        assert!(worst < 0.015, "did not re-engage when the drums came back: worst beat error {worst} s");
     }
 
     #[test]

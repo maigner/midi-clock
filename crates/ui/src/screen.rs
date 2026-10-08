@@ -141,6 +141,9 @@ pub enum Button {
     /// An instrument's MIDI channel, one down / one up.
     ChannelMinus(Instrument),
     ChannelPlus(Instrument),
+    /// Extra note lead in ms, one per press.
+    NoteLeadMinus,
+    NoteLeadPlus,
 }
 
 impl Button {
@@ -176,6 +179,8 @@ impl Button {
                 | Button::DrumPlus(_)
                 | Button::ChannelMinus(_)
                 | Button::ChannelPlus(_)
+                | Button::NoteLeadMinus
+                | Button::NoteLeadPlus
         )
     }
 
@@ -206,7 +211,7 @@ impl Button {
             | Button::DrumPlus(_)
             | Button::DrumPad(_)
             | Button::DrumStep(_) => Some(Page::Drums),
-            Button::ChannelMinus(_) | Button::ChannelPlus(_) => Some(Page::Settings),
+            Button::ChannelMinus(_) | Button::ChannelPlus(_) | Button::NoteLeadMinus | Button::NoteLeadPlus => Some(Page::Settings),
         }
     }
 }
@@ -557,7 +562,7 @@ struct SettingsRow {
 
 impl SettingsView {
     fn build(s: &Status) -> SettingsView {
-        let rows = Instrument::all()
+        let mut rows: Vec<SettingsRow> = Instrument::all()
             .map(|inst| {
                 let (name, color) = match inst {
                     Instrument::Lead => ("LEAD", TEXT),
@@ -567,6 +572,8 @@ impl SettingsView {
                 SettingsRow { name, value: format!("CH {}", s.seq.channel(inst) + 1), color }
             })
             .collect();
+        // How early every note goes out, to swallow the synth's latency.
+        rows.push(SettingsRow { name: "NOTES", value: format!("LEAD {} MS", s.seq.note_lead_ms), color: TEXT });
         SettingsView { rows }
     }
 }
@@ -1041,7 +1048,7 @@ impl Screen {
         // --- settings page -------------------------------------------------------------
         // One row per instrument across the width: its name, then
         // "[-] CH n [+]" with the readout taking what the buttons leave.
-        let setup_n = Instrument::all().count() as i32;
+        let setup_n = Instrument::all().count() as i32 + 1; // + the note lead row
         let row_h = ((h as f64 * 0.16) as i32).min((h - m - by - (setup_n - 1) * m) / setup_n);
         let name_w = (w as f64 * 0.25) as i32;
         let pm_w5 = (w as f64 * 0.15) as i32;
@@ -1052,6 +1059,13 @@ impl Screen {
             let gx = m + name_w + m;
             buttons.push((Button::ChannelMinus(inst), rect(gx, y, pm_w5, row_h)));
             buttons.push((Button::ChannelPlus(inst), rect(gx + pm_w5 + gap + value_w + gap, y, pm_w5, row_h)));
+            setup_rows.push((rect(m, y, name_w, row_h), rect(gx + pm_w5 + gap, y, value_w, row_h)));
+        }
+        {
+            let y = by + (setup_n - 1) * (row_h + m);
+            let gx = m + name_w + m;
+            buttons.push((Button::NoteLeadMinus, rect(gx, y, pm_w5, row_h)));
+            buttons.push((Button::NoteLeadPlus, rect(gx + pm_w5 + gap + value_w + gap, y, pm_w5, row_h)));
             setup_rows.push((rect(m, y, name_w, row_h), rect(gx + pm_w5 + gap, y, value_w, row_h)));
         }
         Self {
@@ -1259,8 +1273,8 @@ impl Screen {
                     };
                     (if 6 * 10 <= r.size.width as i32 - m { long } else { short }.into(), None)
                 }
-                Button::ParamMinus(_) | Button::BassMinus(_) | Button::DrumMinus(_) | Button::ChannelMinus(_) => ("-".into(), None),
-                Button::ParamPlus(_) | Button::BassPlus(_) | Button::DrumPlus(_) | Button::ChannelPlus(_) => ("+".into(), None),
+                Button::ParamMinus(_) | Button::BassMinus(_) | Button::DrumMinus(_) | Button::ChannelMinus(_) | Button::NoteLeadMinus => ("-".into(), None),
+                Button::ParamPlus(_) | Button::BassPlus(_) | Button::DrumPlus(_) | Button::ChannelPlus(_) | Button::NoteLeadPlus => ("+".into(), None),
                 Button::BassScroll(_) => (String::new(), None),
                 Button::BarLock => (String::new(), seq.filter(|q| q.locked).map(|q| TRACK_COLORS[q.track])),
                 Button::BassBarLock => (String::new(), bass.map_or(false, |q| q.locked).then_some(BASS)),

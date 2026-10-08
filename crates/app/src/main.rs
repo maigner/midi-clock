@@ -4,7 +4,7 @@ mod config;
 mod live;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -215,6 +215,12 @@ struct Shared {
     hops: AtomicU64,
     onsets: AtomicU64,
     tempo_strength_milli: AtomicU32,
+    /// `Tracker::onset_bias_s` in microseconds.
+    bias_us: AtomicI32,
+    /// `Tracker::holding`.
+    holding: AtomicBool,
+    /// `Tracker::onset_spread` * 1000.
+    spread_milli: AtomicU32,
     audio_error: AtomicBool,
     /// Samples the key detector's ring could not take (it fell behind).
     key_overflow: AtomicU64,
@@ -404,6 +410,9 @@ fn main() -> Result<()> {
                         shared
                             .tempo_strength_milli
                             .store((tr.last_tempo_strength * 1000.0) as u32, Ordering::Relaxed);
+                        shared.bias_us.store((tr.onset_bias_s() * 1e6) as i32, Ordering::Relaxed);
+                        shared.holding.store(tr.holding(), Ordering::Relaxed);
+                        shared.spread_milli.store((tr.onset_spread() * 1000.0) as u32, Ordering::Relaxed);
                     }
                     thread::park_timeout(Duration::from_millis(2));
                 }
@@ -741,11 +750,14 @@ fn main() -> Result<()> {
         };
         let clipped = shared.clipped.load(Ordering::Relaxed);
         let clip = if clipped > 0 { format!("  CLIP {clipped}") } else { String::new() };
+        let hold = if shared.holding.load(Ordering::Relaxed) { " HOLD" } else { "" };
+        let spread = shared.spread_milli.load(Ordering::Relaxed) as f64 / 1000.0;
         let line = format!(
-            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
+            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  spread {spread:.2}{hold}  bias {:+.0} ms  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
             g.bpm(),
             g.confidence,
             shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
+            shared.bias_us.load(Ordering::Relaxed) as f64 / 1000.0,
             shared.onsets.load(Ordering::Relaxed),
             shared.clicks.load(Ordering::Relaxed),
             clock_stats.ticks.load(Ordering::Relaxed),

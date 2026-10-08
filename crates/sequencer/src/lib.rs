@@ -306,6 +306,9 @@ pub struct Snapshot {
     pub bass: Bass,
     pub drums: Drums,
     pub hit: Option<PadHit>,
+    /// Extra lead for every note in ms, on top of the configured one: the
+    /// synth's own latency, dialled in by ear on the SETUP page.
+    pub note_lead_ms: i32,
 }
 
 /// Which track parameter a +/- press changes.
@@ -462,6 +465,8 @@ pub enum SeqAction {
     /// SETUP: move an instrument's MIDI channel by this much (clamped to
     /// 1..16). The lead's channel is the current pattern's.
     Channel(Instrument, i32),
+    /// Change the extra note lead by this many milliseconds (SETUP page).
+    NoteLead(i32),
     /// KEY: hear the key from the microphone (true) or set it by hand.
     KeyAuto(bool),
     /// KEY: the tonic set by hand (0 = C ... 11 = B); switches to manual.
@@ -506,6 +511,8 @@ struct File {
     drums: Drums,
     #[serde(default)]
     key: KeySetup,
+    #[serde(default)]
+    note_lead_ms: i32,
 }
 
 /// The editable model. Every method that changes something returns true, so
@@ -542,6 +549,8 @@ pub struct SeqState {
     pub drum_rec: bool,
     /// The KEY page: auto or by hand, and the key set by hand.
     pub key: KeySetup,
+    /// Extra lead for every note in ms (SETUP page), `NOTE_LEAD_RANGE`.
+    pub note_lead_ms: i32,
     /// The last pad tap, for the playing thread.
     hit: Option<PadHit>,
     /// A finger dragging a note's length on one of the grids.
@@ -589,6 +598,7 @@ impl Default for SeqState {
             drum_arm: DrumArm::Off,
             drum_rec: false,
             key: KeySetup::default(),
+            note_lead_ms: 0,
             hit: None,
             drag: None,
         }
@@ -617,13 +627,14 @@ impl SeqState {
             bass: self.bass.clone(),
             drums: self.drums.clone(),
             hit: self.hit,
+            note_lead_ms: self.note_lead_ms,
         }
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let f: File = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, drums: f.drums, key: f.key, ..SeqState::default() };
+        let mut s = SeqState { patterns: f.patterns, current: f.current, bass: f.bass, drums: f.drums, key: f.key, note_lead_ms: f.note_lead_ms.clamp(NOTE_LEAD_RANGE.0, NOTE_LEAD_RANGE.1), ..SeqState::default() };
         s.key.key.root %= 12;
         s.bass.normalise();
         s.drums.normalise();
@@ -637,7 +648,7 @@ impl SeqState {
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone(), drums: self.drums.clone(), key: self.key };
+        let f = File { patterns: self.patterns.clone(), current: self.current, bass: self.bass.clone(), drums: self.drums.clone(), key: self.key, note_lead_ms: self.note_lead_ms };
         let text = toml::to_string(&f).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -1103,6 +1114,14 @@ impl SeqState {
                 *ch = new;
                 true
             }
+            SeqAction::NoteLead(d) => {
+                let new = (self.note_lead_ms + d).clamp(NOTE_LEAD_RANGE.0, NOTE_LEAD_RANGE.1);
+                if new == self.note_lead_ms {
+                    return false;
+                }
+                self.note_lead_ms = new;
+                true
+            }
             SeqAction::KeyAuto(auto) => {
                 if self.key.auto == auto {
                     return false;
@@ -1506,6 +1525,9 @@ fn strike(midi: &dyn NoteOut, stats: &SeqStats, pending: &mut Vec<Pending>, vel:
     }
 }
 
+/// Extra note lead the SETUP page allows, in ms: negative delays the notes.
+pub const NOTE_LEAD_RANGE: (i32, i32) = (-50, 150);
+
 /// A 16th the grid moved into the past (a phase correction pulled the beat
 /// earlier while the sequencer was waiting for it) is still played, up to
 /// this late, or half a step if that is less. Later than that the grid
@@ -1517,7 +1539,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
     mut get_grid: G,
     mut get_snapshot: S,
     midi: &dyn NoteOut,
-    lead_s: f64,
+    base_lead_s: f64,
     stop: &AtomicBool,
     stats: &SeqStats,
 ) {
@@ -1558,6 +1580,7 @@ pub fn run<G: FnMut() -> Grid, S: FnMut() -> std::sync::Arc<Snapshot>>(
         }
         let g = get_grid();
         let snap = get_snapshot();
+        let lead_s = base_lead_s + snap.note_lead_ms as f64 / 1000.0;
         let tnow = now();
         if g.running {
             let step_len = g.period / 4.0;
