@@ -58,6 +58,7 @@ enabled = true
 device = "hw:CARD=US2x2,0,0"          # rawmidi port (see --list-devices) or "virtual" for an ALSA sequencer port
 lead_ms = 1.5                         # send each tick this early (USB + slave latency)
 send_start_stop = true
+in_device = "hw:CARD=US2x2,0,0"       # MIDI IN mode follows the MIDI clock arriving here ("" = no input)
 
 [click]
 enabled = true
@@ -89,7 +90,7 @@ rotation = 0                          # 0, 90, 180 or 270 degrees, for portrait-
 fps = 25                              # maximum redraw rate; redraws only happen when something changed
 tty = "/dev/tty1"                     # console switched to graphics mode so it stops drawing over us
 tap_offset_ms = 10.0                  # touch panel latency; raise until a tapped beat sits on the click
-start_mode = "auto"                   # "auto" follows the mic, "manual" waits for taps / Start
+start_mode = "midi"                   # "midi" follows the MIDI input's clock, "auto" the mic, "manual" waits for taps / Start
 manual_bpm = 120.0                    # tempo the manual clock starts with
 tap_timeout_s = 2.0                   # taps farther apart than this start a new tap sequence
 

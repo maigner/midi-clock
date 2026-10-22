@@ -99,6 +99,11 @@ impl ClickSynth {
                     n = missed;
                 }
             }
+            // The beat numbers jumped back (a relock): do not wait for the
+            // count to reach the beat played last, click on from here.
+            if self.last_beat != i64::MIN && n + 1 < self.last_beat {
+                self.last_beat = n - 1;
+            }
             while grid.beat_time(n) - lead < buf_end && nt < triggers.len() {
                 if n > self.last_beat {
                     let idx = ((grid.beat_time(n) - lead - buf_start) * fs).round().max(0.0) as usize;

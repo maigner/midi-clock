@@ -126,6 +126,14 @@ pub fn run<F: FnMut() -> Grid>(mut get_grid: F, midi: &MidiOut, cfg: &ClockConfi
         }
         let t = g.tick_time(n, m) - cfg.lead_s;
         let tnow = now();
+        if t - tnow > g.period {
+            // The grid's beat numbers jumped ahead (a relock numbered the
+            // beats differently): pick up at the beat that is now.
+            let (nb, _) = g.nearest_beat(tnow + cfg.lead_s);
+            n = nb;
+            m = 0;
+            continue;
+        }
         if t - tnow > poll {
             sleep_until(tnow + poll);
             continue;

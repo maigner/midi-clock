@@ -9,10 +9,12 @@
 
 pub mod grid;
 pub mod manual;
+pub mod midi_in;
 pub mod tempo;
 
 pub use grid::{Grid, State};
 pub use manual::{ManualClock, ManualConfig};
+pub use midi_in::MidiFollower;
 
 use std::collections::VecDeque;
 
@@ -138,6 +140,26 @@ pub struct Tracker {
     pub last_tempo_strength: f64,
     pub corrections: u64,
     pub relocks: u64,
+}
+
+/// Simple ratios of the running period that a part of a song can show:
+/// half time, double time, a triplet or 3:2 feel, and their harmonics.
+const FEEL_RATIOS: [f64; 8] = [2.0, 0.5, 3.0, 1.0 / 3.0, 1.5, 2.0 / 3.0, 4.0, 0.25];
+
+/// A period estimate at a simple ratio of the running period is the same
+/// tempo with a different feel: within a song the number on the screen
+/// does not jump by an octave or to a triplet grid, the feel does. Such an
+/// estimate is folded onto the running period. Anything else (a tempo
+/// change that is not a simple ratio) passes through.
+fn fold_octave(p_est: f64, cur: f64) -> f64 {
+    let ratio = p_est / cur;
+    for k in FEEL_RATIOS {
+        // Tight: 4:3 (a real change from 140 to 105) must not pass as 3:2.
+        if (ratio / k - 1.0).abs() < 0.06 {
+            return p_est / k;
+        }
+    }
+    p_est
 }
 
 impl Tracker {
@@ -305,13 +327,19 @@ impl Tracker {
         }
         self.last_est_hop = self.hops;
         let current = if self.grid.running { Some(self.grid.period / self.cfg.hop_dt) } else { None };
-        let Some((p, strength)) = self.estimate_period(current) else {
+        let Some((p, strength)) = self.best_estimate(current) else {
             return;
         };
         self.last_tempo_strength = strength;
-        if strength < self.needed_strength() {
+        let needed = if self.grid.running { self.needed_strength().max(HOT_RELOCK_STRENGTH * self.lock_strength) } else { self.needed_strength() };
+        if strength < needed {
             return;
         }
+        // Within a song the tempo does not double or halve; the feel does.
+        let p = match current {
+            Some(cur) => fold_octave(p, cur),
+            None => p,
+        };
         self.est_history.push(p);
         let n = self.est_history.len();
         // A held clock is only moved by a longer run of agreeing estimates
@@ -337,10 +365,12 @@ impl Tracker {
             t0 += period;
         }
         let _ = t_last;
-        self.grid.period = period;
         if self.grid.running {
-            // Hot relock: keep counting beats, just re-place the grid.
+            // Hot relock: keep counting beats, just re-place the grid. The
+            // beat number of `t0` is read off the old grid, before the
+            // period changes, so the count stays continuous in time.
             let (n, _) = self.grid.nearest_beat(t0);
+            self.grid.period = period;
             self.grid.t0 = t0;
             self.grid.n0 = n;
             self.next_eval_beat = n;
@@ -348,6 +378,7 @@ impl Tracker {
             // The beats were re-placed: the one has to prove itself again.
             self.forget_downbeat();
         } else {
+            self.grid.period = period;
             self.grid.t0 = t0;
             self.grid.n0 = 0;
             self.grid.epoch = self.grid.epoch.wrapping_add(1);
@@ -391,12 +422,6 @@ impl Tracker {
                 self.err_mean += SPREAD_ALPHA * (e - self.err_mean);
                 let d = e - self.err_mean;
                 self.err_var += SPREAD_ALPHA * (d * d - self.err_var);
-                let spread = self.err_var.sqrt();
-                if spread > SPREAD_HOLD {
-                    self.hold = true;
-                } else if spread < SPREAD_RELEASE {
-                    self.hold = false;
-                }
                 let w = (strength as f64 / self.cfg.full_weight_strength).clamp(0.15, 1.0);
                 let max_slew = self.cfg.max_phase_slew * p;
                 let dphase = (self.cfg.kp * err * w).clamp(-max_slew, max_slew);
@@ -404,7 +429,11 @@ impl Tracker {
                 // every onset, so a band that trips the hold is not lagged.
                 let wp = if hold { w * HOLD_PERIOD } else { w };
                 let dperiod = (self.cfg.ki * err * wp).clamp(-0.02 * p, 0.02 * p);
-                self.grid.t0 += dphase;
+                // Pivot on this beat: a period change must not swing beats
+                // far from an old anchor (the anchor could be minutes old).
+                let t_n = self.grid.beat_time(n);
+                self.grid.n0 = n;
+                self.grid.t0 = t_n + dphase;
                 // Hits may pull the period, but never out of the configured tempo window.
                 self.grid.period = (self.grid.period + dperiod).clamp(60.0 / self.cfg.bpm_max, 60.0 / self.cfg.bpm_min);
                 self.hit_beat = n;
@@ -446,12 +475,28 @@ impl Tracker {
         if self.hops - self.last_est_hop >= self.est_hops as u64 {
             self.last_est_hop = self.hops;
             let cur = self.grid.period / self.cfg.hop_dt;
-            if let Some((p_est, strength)) = self.estimate_period(Some(cur)) {
+            if let Some((p_est, strength)) = self.best_estimate(Some(cur)) {
                 self.last_tempo_strength = strength;
+                // The pulse is gone (a synth, a break) when the estimate is
+                // much weaker than it was while locked: hold what we have.
+                // Field numbers: drums 0.3-0.9, a kick alone 0.2-0.6, a
+                // synth or talking 0.1-0.34.
+                // A tempo ramp also weakens the estimate, but its onsets
+                // stay a pulse: the hold needs the spread too.
+                let spread = self.err_var.sqrt();
+                if strength < HOLD_STRENGTH * self.lock_strength && spread > SPREAD_HOLD {
+                    self.hold = true;
+                } else if strength > HOLD_RELEASE * self.lock_strength || spread < SPREAD_RELEASE {
+                    self.hold = false;
+                }
+                let hold = self.hold;
                 if strength >= self.needed_strength() {
                     if !hold {
-                        self.lock_strength += 0.1 * (strength - self.lock_strength);
+                        // Quick to trust a stronger pulse, slow to forget one.
+                        let a = if strength > self.lock_strength { 0.1 } else { 0.02 };
+                        self.lock_strength += a * (strength - self.lock_strength);
                     }
+                    let p_est = fold_octave(p_est, cur);
                     let ratio = p_est / cur;
                     // Coasting with a confident estimate: the beats are
                     // being missed although there is a pulse, so the phase
@@ -480,6 +525,22 @@ impl Tracker {
                     }
                 }
             }
+        }
+    }
+
+    /// The estimate with the hysteresis towards `current`; when that one is
+    /// too weak to count, the free estimate instead if it is strong: a grid
+    /// that drifted off the pulse must not hide the pulse behind its own
+    /// hysteresis.
+    fn best_estimate(&mut self, current: Option<f64>) -> Option<(f64, f64)> {
+        let needed = self.needed_strength();
+        let biased = self.estimate_period(current)?;
+        if biased.1 >= needed || current.is_none() {
+            return Some(biased);
+        }
+        match self.estimate_period(None) {
+            Some(free) if free.1 >= needed => Some(free),
+            _ => Some(biased),
         }
     }
 
@@ -583,9 +644,15 @@ const SPREAD_ALPHA: f64 = 0.25;
 /// which they are no pulse and the tempo is held: a drummer spreads
 /// 0.01-0.04, onsets at random over the accept window 0.05-0.1 (the phase
 /// loop keeps chasing them, which narrows the measured spread).
-const SPREAD_HOLD: f64 = 0.07;
+const SPREAD_HOLD: f64 = 0.08;
 /// The hold is released below this spread.
-const SPREAD_RELEASE: f64 = 0.045;
+const SPREAD_RELEASE: f64 = 0.05;
+/// A running clock is only re-placed by an estimate at least this share of
+/// the locked strength: junk never takes over a clock that is running.
+const HOT_RELOCK_STRENGTH: f64 = 0.5;
+/// The hold is released when the estimate is back above this share of the
+/// locked strength.
+const HOLD_RELEASE: f64 = 0.8;
 /// Weight of the onsets' period correction while holding.
 const HOLD_PERIOD: f64 = 0.25;
 /// Fraction of the pulse's tempo strength an estimate needs to move a
@@ -765,6 +832,120 @@ mod tests {
     /// A clean pulse at `bpm` for `pulse_s`, then `noise_s` of random onsets
     /// (a synth without the drums), then the pulse again. Returns the grid
     /// after the noise and the worst beat error over the last 3 s.
+    /// Onsets at `bpm`, one every `every` beats per segment (1 = on the
+    /// beat, 0.5 = double time, 2 = half time); returns the bpm the grid
+    /// showed at the end of each segment.
+    fn feel_changes(bpm: f64, segments: &[(f64, f64)], tweak: impl FnOnce(&mut TrackerConfig)) -> Vec<f64> {
+        let mut cfg = TrackerConfig::default();
+        tweak(&mut cfg);
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let period = 60.0 / bpm;
+        let mut out = Vec::new();
+        let mut t_seg = 0.0;
+        let mut next = 0.5;
+        for &(dur, every) in segments {
+            let end = t_seg + dur;
+            let step = period * every;
+            // keep the subdivision phase-aligned with the beat
+            while next < t_seg {
+                next += step;
+            }
+            let mut i = (t_seg / dt) as u64;
+            while (i as f64) * dt < end {
+                let t = (i + 1) as f64 * dt;
+                let (mut odf, mut onset) = (0.3, None);
+                if t >= next && t - dt < next {
+                    odf = 8.0;
+                    onset = Some((next, odf));
+                    next += step;
+                }
+                tr.process_hop(HopInput { time: t, odf, kick: odf, onset });
+                if std::env::var("TRACE").is_ok() && i % (1.0 / dt) as u64 == 0 {
+                    eprintln!("t {t:5.1} bpm {:6.2} {:?} str {:.2}", tr.grid().bpm(), tr.grid().state, tr.last_tempo_strength);
+                }
+                i += 1;
+            }
+            out.push(tr.grid().bpm());
+            t_seg = end;
+        }
+        out
+    }
+
+    #[test]
+    fn double_time_and_half_time_do_not_change_the_tempo() {
+        let segs = [(12.0, 1.0), (16.0, 0.5), (12.0, 1.0), (16.0, 2.0), (12.0, 1.0)];
+        let bpms = feel_changes(100.0, &segs, |_| {});
+        for (i, b) in bpms.iter().enumerate() {
+            assert!((b - 100.0).abs() < 2.0, "segment {i}: {b:.1} bpm, all {bpms:?}");
+        }
+        // Even when the estimator itself prefers the other octave once the
+        // eighths are as strong as the beats (a prior centred on 140 and no
+        // hysteresis), the number does not jump.
+        let bpms = feel_changes(100.0, &segs, |c| {
+            c.bpm_center = 140.0;
+            c.bpm_width_octaves = 0.5;
+            c.tempo_hysteresis = 0.0;
+        });
+        assert!((bpms[0] - 100.0).abs() < 2.0, "first lock {bpms:?}");
+        for (i, b) in bpms.iter().enumerate() {
+            assert!((b - 100.0).abs() < 2.0, "segment {i} with a 140 prior: {b:.1} bpm, all {bpms:?}");
+        }
+    }
+
+    /// The beat count must stay continuous in time through tempo changes
+    /// and relocks: the click and the clock output count beats and stall
+    /// when the number of "now" jumps.
+    #[test]
+    fn beat_numbers_stay_continuous_through_a_tempo_change() {
+        let cfg = TrackerConfig::default();
+        let dt = cfg.hop_dt;
+        let mut tr = Tracker::new(cfg);
+        let mut next = 0.5;
+        let mut last_n: Option<i64> = None;
+        let mut worst = 0i64;
+        let mut relocked = false;
+        let hops = (40.0 / dt) as u64;
+        for i in 0..hops {
+            let t = (i + 1) as f64 * dt;
+            let period = if t < 15.0 { 60.0 / 140.0 } else { 60.0 / 105.0 };
+            let (mut odf, mut onset) = (0.3, None);
+            if t >= next && t - dt < next {
+                odf = 8.0;
+                onset = Some((next + if t > 20.0 { 0.0 } else { 0.0 }, 8.0));
+                next += period;
+            }
+            tr.process_hop(HopInput { time: t, odf, kick: odf, onset });
+            let g = tr.grid();
+            if g.running {
+                let (n, _) = g.nearest_beat(t);
+                if let Some(l) = last_n {
+                    worst = worst.max((n - l).abs());
+                    assert!((n - l).abs() <= 1, "beat number jumped from {l} to {n} at t {t:.2} ({:.1} bpm)", g.bpm());
+                }
+                last_n = Some(n);
+                if g.state == State::Running && (g.bpm() - 105.0).abs() < 2.0 && t > 15.0 {
+                    relocked = true;
+                }
+            } else {
+                last_n = None;
+            }
+        }
+        assert!(relocked, "never followed the change to 105 bpm");
+    }
+
+    #[test]
+    fn fold_octave_folds_simple_ratios_only() {
+        assert!((fold_octave(2.0, 1.0) - 1.0).abs() < 1e-9);
+        assert!((fold_octave(0.5, 1.0) - 1.0).abs() < 1e-9);
+        assert!((fold_octave(1.9, 1.0) - 0.95).abs() < 1e-9);
+        assert!((fold_octave(1.5, 1.0) - 1.0).abs() < 1e-9);
+        assert!((fold_octave(3.0, 1.0) - 1.0).abs() < 1e-9);
+        assert!((fold_octave(1.3, 1.0) - 1.3).abs() < 1e-9, "a real tempo change passes");
+        assert!((fold_octave(4.0 / 3.0, 1.0) - 4.0 / 3.0).abs() < 1e-9, "4:3 is not 3:2");
+        assert!((fold_octave(0.8, 1.0) - 0.8).abs() < 1e-9);
+    }
+
     fn pulse_noise_pulse(bpm: f64, pulse_s: f64, noise_s: f64) -> (Grid, f64) {
         let cfg = TrackerConfig::default();
         let dt = cfg.hop_dt;

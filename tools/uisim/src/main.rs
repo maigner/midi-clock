@@ -305,6 +305,7 @@ fn main() -> Result<()> {
                 tempo_strength: tracker.last_tempo_strength as f32,
                 level_db: level,
                 clipping: false,
+                midi_in: Grid::default(),
                 peak_db: level,
                 xruns: 0,
                 ticks,
@@ -377,6 +378,13 @@ fn apply(
                 *live = tracker.grid();
             }
         }
+        Action::SetMode(Mode::MidiIn) => {
+            // The simulator has no MIDI input: the external clock is absent.
+            if *mode != Mode::MidiIn {
+                *mode = Mode::MidiIn;
+                *live = Grid::default();
+            }
+        }
         Action::Tap(t) => {
             manual.tap(t);
             *live = manual.grid();
@@ -386,7 +394,7 @@ fn apply(
                 if manual.set_one(t) {
                     *live = manual.grid();
                 }
-            } else if tracker.set_downbeat(t) {
+            } else if *mode == Mode::Auto && tracker.set_downbeat(t) {
                 *live = tracker.grid();
             }
         }

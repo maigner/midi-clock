@@ -1,4 +1,4 @@
-//! MIDI output. Two backends behind one type:
+//! MIDI output and input. The output has two backends behind one type:
 //!
 //! * ALSA rawmidi (`hw:...`), the shortest path to a USB endpoint. This is
 //!   what runs on the Pi.
@@ -188,8 +188,46 @@ fn seq_event(bytes: &[u8]) -> Result<seq::Event<'static>> {
     Ok(ev)
 }
 
-/// Human-readable list of rawmidi output ports on all cards.
-pub fn list_outputs() -> Vec<String> {
+/// MIDI input: a rawmidi capture port such as `hw:CARD=US2x2,0,0`. Read
+/// with a timeout so the owning thread can notice a stop request.
+pub struct MidiIn {
+    rm: Rawmidi,
+    fds: Vec<libc::pollfd>,
+    name: String,
+}
+
+impl MidiIn {
+    pub fn open(name: &str) -> Result<Self> {
+        let rm = Rawmidi::new(name, Direction::Capture, true).with_context(|| format!("opening MIDI input {name}"))?;
+        let fds = alsa::poll::Descriptors::get(&rm).context("MIDI input poll descriptors")?;
+        Ok(Self { rm, fds, name: name.to_string() })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Wait up to `timeout_ms` for bytes and read what has arrived. Returns
+    /// the number of bytes put into `buf`, 0 when the time ran out.
+    pub fn read(&mut self, buf: &mut [u8], timeout_ms: i32) -> Result<usize> {
+        for fd in self.fds.iter_mut() {
+            fd.revents = 0;
+        }
+        let ready = alsa::poll::poll(&mut self.fds, timeout_ms).context("polling MIDI input")?;
+        if ready == 0 {
+            return Ok(0);
+        }
+        let mut io = self.rm.io();
+        match std::io::Read::read(&mut io, buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(0),
+            Err(e) => Err(e).context("rawmidi read"),
+        }
+    }
+}
+
+/// Human-readable list of rawmidi ports on all cards in `dir`.
+fn list_ports(dir: Direction) -> Vec<String> {
     let mut out = Vec::new();
     for card in alsa::card::Iter::new().flatten() {
         let idx = card.get_index();
@@ -199,7 +237,7 @@ pub fn list_outputs() -> Vec<String> {
         };
         let card_name = card.get_name().unwrap_or_default();
         for info in alsa::rawmidi::Iter::new(&ctl).flatten() {
-            if info.get_stream() != Direction::Playback {
+            if info.get_stream() != dir {
                 continue;
             }
             out.push(format!(
@@ -213,4 +251,14 @@ pub fn list_outputs() -> Vec<String> {
         }
     }
     out
+}
+
+/// Human-readable list of rawmidi output ports on all cards.
+pub fn list_outputs() -> Vec<String> {
+    list_ports(Direction::Playback)
+}
+
+/// Human-readable list of rawmidi input ports on all cards.
+pub fn list_inputs() -> Vec<String> {
+    list_ports(Direction::Capture)
 }

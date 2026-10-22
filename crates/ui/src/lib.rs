@@ -173,7 +173,7 @@ impl Session {
         let target = status.live.bpm();
         let dt = (now - self.bpm_at).clamp(0.0, 1.0);
         self.bpm_at = now;
-        let smooth = status.mode == Mode::Auto && status.live.running && (target - self.bpm_smooth).abs() < BPM_JUMP;
+        let smooth = status.mode != Mode::Manual && status.live.running && (target - self.bpm_smooth).abs() < BPM_JUMP;
         if smooth {
             let a = 1.0 - (-dt / BPM_SMOOTH_S).exp();
             self.bpm_smooth += a * (target - self.bpm_smooth);
@@ -472,6 +472,7 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::PageTempo | Button::PageKey | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => return,
         Button::ModeAuto => Action::SetMode(Mode::Auto),
         Button::ModeManual => Action::SetMode(Mode::Manual),
+        Button::ModeMidiIn => Action::SetMode(Mode::MidiIn),
         Button::Minus5 => Action::Nudge(-5.0),
         Button::Minus1 => Action::Nudge(-1.0),
         Button::Tap => Action::Tap(t),

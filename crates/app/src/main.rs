@@ -17,7 +17,7 @@ use ringbuf::HeapRb;
 use config::Config;
 use live::Live;
 use sequencer::SeqState;
-use tracker::{Grid, HopInput, ManualClock, State, Tracker};
+use tracker::{Grid, HopInput, ManualClock, MidiFollower, State, Tracker};
 use ui::{Action, Mode, Page};
 
 #[derive(Parser, Debug)]
@@ -47,7 +47,7 @@ struct Args {
     /// Run without the touch-screen UI even if the config enables it.
     #[arg(long)]
     no_ui: bool,
-    /// Start in this mode: auto (follow the microphone) or manual (tap / set tempo).
+    /// Start in this mode: auto (follow the microphone), manual (tap / set tempo) or midi (follow the MIDI input's clock).
     #[arg(long, value_parser = parse_mode)]
     mode: Option<Mode>,
     /// Render one UI frame with example data to this PPM file and exit (layout check).
@@ -62,7 +62,8 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Ok(Mode::Auto),
         "manual" => Ok(Mode::Manual),
-        _ => Err("expected 'auto' or 'manual'".into()),
+        "midi" | "midi-in" | "midiin" => Ok(Mode::MidiIn),
+        _ => Err("expected 'auto', 'manual' or 'midi'".into()),
     }
 }
 
@@ -81,6 +82,7 @@ fn snapshot(path: &std::path::Path, size: &str) -> Result<()> {
         level_db: -18.0,
         clipping: false,
         peak_db: -18.0,
+        midi_in: Grid::default(),
         xruns: 0,
         ticks: 12345,
         midi: true,
@@ -224,6 +226,12 @@ struct Shared {
     audio_error: AtomicBool,
     /// Samples the key detector's ring could not take (it fell behind).
     key_overflow: AtomicU64,
+    /// Realtime messages (clock, start, stop) read from the MIDI input.
+    midi_in_msgs: AtomicU64,
+    /// Largest move of a beat by one follower update since the last status line (us).
+    midi_in_shift_us: AtomicU32,
+    /// The follower's fit residual (input jitter), us.
+    midi_in_jitter_us: AtomicU32,
 }
 
 fn main() -> Result<()> {
@@ -235,6 +243,10 @@ fn main() -> Result<()> {
         }
         println!("MIDI outputs:");
         for l in rtio::midi::list_outputs() {
+            println!("  {l}");
+        }
+        println!("MIDI inputs:");
+        for l in rtio::midi::list_inputs() {
             println!("  {l}");
         }
         println!("Framebuffer:");
@@ -267,6 +279,7 @@ fn main() -> Result<()> {
     }
     let start_mode = args.mode.unwrap_or(match cfg.ui.start_mode.to_ascii_lowercase().as_str() {
         "manual" => Mode::Manual,
+        "midi" | "midi-in" | "midiin" => Mode::MidiIn,
         _ => Mode::Auto,
     });
 
@@ -374,6 +387,90 @@ fn main() -> Result<()> {
                 midiclock::run(|| **live.grid.load(), &midi, &ccfg, &shared.stop, &stats);
             })
             .expect("spawn midi thread")
+    });
+
+    // --- MIDI input thread ---------------------------------------------------
+    // Reads the MIDI input and keeps the external clock's grid up to date;
+    // in MIDI IN mode that grid is the live one.
+    let midi_in = if cfg.midi.in_device.is_empty() || args.no_midi {
+        eprintln!("midi in: disabled");
+        None
+    } else {
+        match rtio::MidiIn::open(&cfg.midi.in_device) {
+            Ok(m) => {
+                eprintln!("midi in: {}", m.name());
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("midi in: {e:#}; MIDI IN mode will have no clock");
+                None
+            }
+        }
+    };
+    let midi_in_thread = midi_in.map(|mut port| {
+        let live = live.clone();
+        let shared = shared.clone();
+        let bar_len = cfg.tempo.bar_len;
+        let prio = cfg.realtime.midi_priority;
+        thread::Builder::new()
+            .name("midi-in".into())
+            .spawn(move || {
+                for w in rtio::rt::setup_thread("midi-in", prio, cpu) {
+                    eprintln!("warning: {w}");
+                }
+                let mut f = MidiFollower::new(bar_len);
+                let mut buf = [0u8; 256];
+                // Ticks that queued up before we listened would all carry
+                // this moment's timestamp: throw them away.
+                while matches!(port.read(&mut buf, 0), Ok(n) if n > 0) {}
+                while !shared.stop.load(Ordering::Relaxed) {
+                    let one = live.set_one_midi.swap(0, Ordering::Relaxed);
+                    if one != 0 && f.set_one(f64::from_bits(one)) {
+                        live.publish_midi_in(f.grid());
+                    }
+                    match port.read(&mut buf, 20) {
+                        Ok(0) => {
+                            if f.idle(rtio::now()) {
+                                live.publish_midi_in(f.grid());
+                            }
+                        }
+                        Ok(n) => {
+                            let t = rtio::now();
+                            let mut changed = false;
+                            let mut msgs = 0;
+                            for &b in &buf[..n] {
+                                let c = match b {
+                                    rtio::midi::CLOCK => f.tick(t),
+                                    rtio::midi::START => f.start(t),
+                                    rtio::midi::CONTINUE => f.cont(t),
+                                    rtio::midi::STOP => f.stop(t),
+                                    _ => continue,
+                                };
+                                msgs += 1;
+                                changed |= c;
+                            }
+                            if msgs > 0 {
+                                shared.midi_in_msgs.fetch_add(msgs, Ordering::Relaxed);
+                            }
+                            if changed {
+                                let old = **live.midi_in_grid.load();
+                                let g = f.grid();
+                                if old.running && g.running && old.epoch == g.epoch {
+                                    let shift = (g.beat_time(g.n0) - old.beat_time(g.n0)).abs();
+                                    shared.midi_in_shift_us.fetch_max((shift * 1e6) as u32, Ordering::Relaxed);
+                                }
+                                shared.midi_in_jitter_us.store((f.residual_s() * 1e6) as u32, Ordering::Relaxed);
+                                live.publish_midi_in(g);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("midi in: {e:#}; no more external clock");
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("spawn midi-in thread")
     });
 
     // --- Tracker thread ----------------------------------------------------
@@ -638,6 +735,7 @@ fn main() -> Result<()> {
                             level_db: level,
                             clipping: shared.clipping.load(Ordering::Relaxed),
                             peak_db: -(shared.peak_slow_milli_db.load(Ordering::Relaxed) as f32) / 1000.0,
+                            midi_in: **live.midi_in_grid.load(),
                             xruns: shared.xruns.load(Ordering::Relaxed),
                             ticks: stats.ticks.load(Ordering::Relaxed),
                             midi: midi_on,
@@ -664,6 +762,11 @@ fn main() -> Result<()> {
                                     live.set_mode(Mode::Auto);
                                 }
                             }
+                            Action::SetMode(Mode::MidiIn) => {
+                                if live.mode() != Mode::MidiIn {
+                                    live.set_mode(Mode::MidiIn);
+                                }
+                            }
                             Action::Tap(t) => {
                                 manual.tap(t);
                                 live.publish_manual(manual.grid());
@@ -675,6 +778,7 @@ fn main() -> Result<()> {
                                     }
                                 }
                                 Mode::Auto => live.set_one.store(t.to_bits(), Ordering::Relaxed),
+                                Mode::MidiIn => live.set_one_midi.store(t.to_bits(), Ordering::Relaxed),
                             },
                             Action::Nudge(d) => {
                                 manual.nudge_bpm(d, now);
@@ -741,6 +845,7 @@ fn main() -> Result<()> {
         let mode = match live.mode() {
             Mode::Auto => "auto",
             Mode::Manual => "manual",
+            Mode::MidiIn => "midi",
         };
         let level = -(shared.level_milli_db.load(Ordering::Relaxed) as f32) / 1000.0;
         let key_s = match **key_est.load() {
@@ -752,8 +857,19 @@ fn main() -> Result<()> {
         let clip = if clipped > 0 { format!("  CLIP {clipped}") } else { String::new() };
         let hold = if shared.holding.load(Ordering::Relaxed) { " HOLD" } else { "" };
         let spread = shared.spread_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        let ext = {
+            let g = **live.midi_in_grid.load();
+            let n = shared.midi_in_msgs.load(Ordering::Relaxed);
+            let shift = shared.midi_in_shift_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+            let jit = shared.midi_in_jitter_us.load(Ordering::Relaxed) as f64 / 1000.0;
+            match g.state {
+                State::Idle if n == 0 => String::new(),
+                State::Running => format!("  ext {:.1} bpm jit {jit:.1} shift {shift:.2} ms", g.bpm()),
+                _ => "  ext stopped".to_string(),
+            }
+        };
         let line = format!(
-            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  spread {spread:.2}{hold}  bias {:+.0} ms  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
+            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  spread {spread:.2}{hold}  bias {:+.0} ms{ext}  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
             g.bpm(),
             g.confidence,
             shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
@@ -797,6 +913,10 @@ fn main() -> Result<()> {
     if let Some(t) = midi_thread {
         let _ = t.join();
         eprintln!("midi clock: {}", clock_stats.summary());
+    }
+    if let Some(t) = midi_in_thread {
+        let _ = t.join();
+        eprintln!("midi in: {} realtime messages", shared.midi_in_msgs.load(Ordering::Relaxed));
     }
     eprintln!("xruns: {}", shared.xruns.load(Ordering::Relaxed));
     if shared.audio_error.load(Ordering::Relaxed) {

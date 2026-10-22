@@ -1,7 +1,7 @@
-//! Who drives the beat grid: the tracker (auto) or the manual clock. Both
-//! publish into `grid`, which the click and MIDI clock read; a mutex around
-//! the mode keeps a mode switch from racing with a tracker publish. The lock
-//! is held only for one pointer store.
+//! Who drives the beat grid: the tracker (auto), the manual clock or the
+//! external MIDI clock (MIDI IN). All three publish into `grid`, which the
+//! click and MIDI clock read; a mutex around the mode keeps a mode switch
+//! from racing with a publish. The lock is held only for one pointer store.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,11 +17,15 @@ pub struct Live {
     pub grid: ArcSwap<Grid>,
     /// What the tracker thinks, regardless of mode (shown as "mic hears").
     pub tracker_grid: ArcSwap<Grid>,
+    /// What the MIDI input's clock says, regardless of mode.
+    pub midi_in_grid: ArcSwap<Grid>,
     /// Tracker thread: take over the live grid on the next hop.
     pub adopt: AtomicBool,
     /// Tracker thread: the beat nearest this monotonic time (as f64 bits,
     /// 0 = nothing pending) is beat one. Set by the ONE button in auto mode.
     pub set_one: AtomicU64,
+    /// The same for the MIDI input thread in MIDI IN mode.
+    pub set_one_midi: AtomicU64,
 }
 
 impl Live {
@@ -31,17 +35,15 @@ impl Live {
             mode_fast: AtomicU8::new(mode as u8),
             grid: ArcSwap::from_pointee(Grid::default()),
             tracker_grid: ArcSwap::from_pointee(Grid::default()),
+            midi_in_grid: ArcSwap::from_pointee(Grid::default()),
             adopt: AtomicBool::new(false),
             set_one: AtomicU64::new(0),
+            set_one_midi: AtomicU64::new(0),
         }
     }
 
     pub fn mode(&self) -> Mode {
-        if self.mode_fast.load(Ordering::Relaxed) == Mode::Manual as u8 {
-            Mode::Manual
-        } else {
-            Mode::Auto
-        }
+        Mode::from_u8(self.mode_fast.load(Ordering::Relaxed))
     }
 
     /// Called by the tracker thread whenever its grid changed.
@@ -61,6 +63,15 @@ impl Live {
         }
     }
 
+    /// Called by the MIDI input thread whenever the external clock's grid changed.
+    pub fn publish_midi_in(&self, g: Grid) {
+        self.midi_in_grid.store(Arc::new(g));
+        let m = self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        if *m == Mode::MidiIn {
+            self.grid.store(Arc::new(g));
+        }
+    }
+
     /// Switch mode. Returns the grid that was live at the moment of the switch,
     /// so the new owner can continue from it.
     pub fn set_mode(&self, mode: Mode) -> Grid {
@@ -68,8 +79,11 @@ impl Live {
         *m = mode;
         self.mode_fast.store(mode as u8, Ordering::Relaxed);
         let g = **self.grid.load();
-        if mode == Mode::Auto {
-            self.adopt.store(true, Ordering::Relaxed);
+        match mode {
+            Mode::Auto => self.adopt.store(true, Ordering::Relaxed),
+            // The external clock is what it is: no adopting its predecessor.
+            Mode::MidiIn => self.grid.store(Arc::new(**self.midi_in_grid.load())),
+            Mode::Manual => {}
         }
         g
     }

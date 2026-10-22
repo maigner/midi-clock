@@ -216,11 +216,14 @@ pub struct Midi {
     /// Send every tick this much early.
     pub lead_ms: f64,
     pub send_start_stop: bool,
+    /// Rawmidi input port an external MIDI clock arrives on (MIDI IN mode);
+    /// empty = none.
+    pub in_device: String,
 }
 
 impl Default for Midi {
     fn default() -> Self {
-        Self { enabled: true, device: "hw:CARD=US2x2,0,0".into(), lead_ms: 1.5, send_start_stop: true }
+        Self { enabled: true, device: "hw:CARD=US2x2,0,0".into(), lead_ms: 1.5, send_start_stop: true, in_device: "hw:CARD=US2x2,0,0".into() }
     }
 }
 
@@ -314,7 +317,7 @@ impl Default for Ui {
             fps: d.fps,
             tty: d.tty,
             tap_offset_ms: d.tap_offset_s * 1000.0,
-            start_mode: "auto".into(),
+            start_mode: "midi".into(),
             manual_bpm: 120.0,
             tap_timeout_s: 2.0,
         }

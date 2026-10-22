@@ -21,6 +21,19 @@ use crate::canvas::{Canvas, Scaled};
 pub enum Mode {
     Auto,
     Manual,
+    /// An external MIDI clock on the MIDI input is the master.
+    MidiIn,
+}
+
+impl Mode {
+    /// Inverse of `as u8`.
+    pub fn from_u8(v: u8) -> Mode {
+        match v {
+            1 => Mode::Manual,
+            2 => Mode::MidiIn,
+            _ => Mode::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +54,8 @@ pub struct Status {
     pub live: Grid,
     /// What the tracker hears (also in manual mode).
     pub tracker: Grid,
+    /// What the MIDI input's clock says (state `Idle` = no clock arriving).
+    pub midi_in: Grid,
     pub tempo_strength: f32,
     pub level_db: f32,
     /// The input hit full scale within the last second or so.
@@ -91,6 +106,7 @@ pub enum Button {
     PageSettings,
     ModeAuto,
     ModeManual,
+    ModeMidiIn,
     Minus5,
     Minus1,
     Tap,
@@ -189,6 +205,7 @@ impl Button {
             Button::PageTempo | Button::PageKey | Button::PageLead | Button::PageBass | Button::PageDrums | Button::PageSettings => None,
             Button::ModeAuto
             | Button::ModeManual
+            | Button::ModeMidiIn
             | Button::Minus5
             | Button::Minus1
             | Button::Tap
@@ -238,6 +255,7 @@ const TEXT: Rgb888 = Rgb888::new(225, 228, 232);
 const DIM: Rgb888 = Rgb888::new(105, 115, 128);
 const AUTO: Rgb888 = Rgb888::new(70, 190, 230);
 const MANUAL: Rgb888 = Rgb888::new(240, 150, 50);
+const MIDI_IN: Rgb888 = Rgb888::new(235, 95, 165);
 const GREEN: Rgb888 = Rgb888::new(80, 200, 110);
 const YELLOW: Rgb888 = Rgb888::new(230, 200, 60);
 const RED: Rgb888 = Rgb888::new(230, 80, 70);
@@ -661,6 +679,15 @@ const GAIN_SILENT_DB: f32 = -50.0;
 
 /// What the player should do with the mic pre, judged from the loudest
 /// moment of the last few seconds; nothing while there is no input.
+/// The colour of the clock's owner.
+fn mode_color(m: Mode) -> Rgb888 {
+    match m {
+        Mode::Auto => AUTO,
+        Mode::Manual => MANUAL,
+        Mode::MidiIn => MIDI_IN,
+    }
+}
+
 fn gain_hint(s: &Status) -> Option<(&'static str, Rgb888)> {
     if s.clipping || s.peak_db > GAIN_HIGH_DB {
         Some(("GAIN DOWN", RED))
@@ -747,21 +774,27 @@ impl View {
                     ("RUNNING", GREEN)
                 }
             }
+            Mode::MidiIn => match s.midi_in.state {
+                State::Idle => ("NO CLOCK", DIM),
+                State::Running => ("RUNNING", GREEN),
+                _ => ("STOPPED", RED),
+            },
         };
-        let bpm = if s.mode == Mode::Auto && !s.tracker.running && s.tracker.state != State::Coasting {
-            "---.-".to_string()
-        } else {
-            format!("{:5.1}", s.bpm_shown.unwrap_or_else(|| live.bpm()))
+        let no_tempo = match s.mode {
+            Mode::Auto => !s.tracker.running && s.tracker.state != State::Coasting,
+            Mode::Manual => false,
+            Mode::MidiIn => s.midi_in.state == State::Idle,
         };
+        let bpm = if no_tempo { "---.-".to_string() } else { format!("{:5.1}", s.bpm_shown.unwrap_or_else(|| live.bpm())) };
         let (info, conf_pct) = match s.mode {
             Mode::Auto => (format!("TEMPO STRENGTH {:.2}", s.tempo_strength), Some((s.tracker.confidence * 100.0) as u32)),
-            Mode::Manual => {
+            Mode::Manual | Mode::MidiIn => {
                 let mic = if s.tracker.running {
                     format!("MIC HEARS {:5.1} BPM", s.tracker.bpm())
                 } else {
                     "MIC HEARS NO BEAT".to_string()
                 };
-                let taps = if s.taps > 0 { format!("   TAPS {}", s.taps) } else { String::new() };
+                let taps = if s.taps > 0 && s.mode == Mode::Manual { format!("   TAPS {}", s.taps) } else { String::new() };
                 (format!("{mic}{taps}"), None)
             }
         };
@@ -886,20 +919,21 @@ impl Screen {
         let state_avail = state_end - tabs_end;
         let state_k = (1..=small).rev().find(|k| 9 * 10 * *k as i32 <= state_avail).unwrap_or(1);
         // --- tempo page ----------------------------------------------------------------
+        // A column at the left: MIDI IN, AUTO, MANUAL and ONE, down to the tap row.
         let mode_w = (w as f64 * 0.17) as i32;
         let y1 = (h as f64 * 0.16) as i32;
-        let mode_h = (h as f64 * 0.17) as i32;
-        buttons.push((Button::ModeAuto, rect(m, y1, mode_w, mode_h)));
-        buttons.push((Button::ModeManual, rect(m, y1 + mode_h + m, mode_w, mode_h)));
+        let ya = (h as f64 * 0.66) as i32;
+        let ha = (h as f64 * 0.15) as i32;
+        let col_h = (ya - m - y1 - 3 * m) / 4;
+        for (i, b) in [Button::ModeMidiIn, Button::ModeAuto, Button::ModeManual].into_iter().enumerate() {
+            buttons.push((b, rect(m, y1 + i as i32 * (col_h + m), mode_w, col_h)));
+        }
+        let one_y = y1 + 3 * (col_h + m);
+        buttons.push((Button::One, rect(m, one_y, mode_w, ya - m - one_y)));
         let bpm_left = 2 * m + mode_w;
         let bpm_cx = (bpm_left + w) / 2;
         let big = (((w - bpm_left) as f64 * 0.85 / 50.0).min(h as f64 * 0.30 / 20.0).floor() as u32).max(2);
         let unit = (w - 7 * m) / 6;
-        let ya = (h as f64 * 0.66) as i32;
-        let ha = (h as f64 * 0.15) as i32;
-        // ONE under the mode buttons, above the tap row.
-        let one_y = y1 + 2 * (mode_h + m);
-        buttons.push((Button::One, rect(m, one_y, mode_w, ya - m - one_y)));
         let mut x = m;
         for (b, units) in [(Button::Minus5, 1), (Button::Minus1, 1), (Button::Tap, 2), (Button::Plus1, 1), (Button::Plus5, 1)] {
             let bw = unit * units + m * (units - 1);
@@ -915,8 +949,9 @@ impl Screen {
         // right of them, and underneath the twelve roots in a row, then the
         // scales in two rows (by hand only; the root row is the chroma strip
         // while the key is heard).
-        buttons.push((Button::KeyAuto, rect(m, y1, mode_w, mode_h)));
-        buttons.push((Button::KeyManual, rect(m, y1 + mode_h + m, mode_w, mode_h)));
+        // AUTO and MANUAL in the rows the tempo page has them (the top row is MIDI IN there).
+        buttons.push((Button::KeyAuto, rect(m, y1 + col_h + m, mode_w, col_h)));
+        buttons.push((Button::KeyManual, rect(m, y1 + 2 * (col_h + m), mode_w, col_h)));
         let ky = (h as f64 * 0.55) as i32;
         let kh = (h as f64 * 0.12) as i32;
         let root_w = (w - 13 * m) / 12;
@@ -1251,13 +1286,17 @@ impl Screen {
                 Button::PageSettings => (self.tab_labels[5].into(), (v.page == Page::Settings).then_some(TEXT)),
                 Button::ModeAuto => ("AUTO".into(), (v.mode == Mode::Auto).then_some(AUTO)),
                 Button::ModeManual => ("MANUAL".into(), (v.mode == Mode::Manual).then_some(MANUAL)),
+                Button::ModeMidiIn => {
+                    let label = if 7 * 10 <= r.size.width as i32 - m { "MIDI IN" } else { "MIDI" };
+                    (label.into(), (v.mode == Mode::MidiIn).then_some(MIDI_IN))
+                }
                 Button::Minus5 => ("-5".into(), None),
                 Button::Minus1 => ("-1".into(), None),
                 Button::Tap => ("TAP".into(), (v.mode == Mode::Manual).then_some(MANUAL)),
                 Button::Plus1 => ("+1".into(), None),
                 Button::Plus5 => ("+5".into(), None),
                 Button::StartStop => (if v.running { "STOP" } else { "START" }.into(), None),
-                Button::One => ("ONE".into(), v.one_known.then_some(if v.mode == Mode::Auto { AUTO } else { MANUAL })),
+                Button::One => ("ONE".into(), v.one_known.then_some(mode_color(v.mode))),
                 Button::KeyAuto => ("AUTO".into(), (v.key_auto).then_some(AUTO)),
                 Button::KeyManual => ("MANUAL".into(), (!v.key_auto).then_some(MANUAL)),
                 Button::KeyRoot(pc) => (PITCH_NAMES[*pc as usize].into(), key.and_then(|q| q.key).filter(|k| k.root == *pc).map(|_| MANUAL)),
@@ -1420,10 +1459,7 @@ impl Screen {
         // --- big BPM ----------------------------------------------------------
         let bpm_top = (h as f64 * 0.16) as i32;
         let bpm_cy = bpm_top + (10 * self.big) as i32;
-        let bpm_color = match v.mode {
-            Mode::Auto => AUTO,
-            Mode::Manual => MANUAL,
-        };
+        let bpm_color = mode_color(v.mode);
         self.text(c, &v.bpm, Point::new(cx, bpm_cy), self.big, bpm_color, Alignment::Center);
         self.text(c, "BPM", Point::new(cx + (25 * self.big) as i32 + m, bpm_cy + (6 * self.big) as i32), s, DIM, Alignment::Left);
         // --- info line + confidence bar -------------------------------------
@@ -1848,6 +1884,7 @@ mod tests {
             mode: Mode::Auto,
             live: Grid { running: true, t0: 100.0, n0: 0, period: 0.5, state: State::Running, confidence: 0.8, ..Grid::default() },
             tracker: Grid { running: true, t0: 100.0, n0: 0, period: 0.5, state: State::Running, confidence: 0.8, ..Grid::default() },
+            midi_in: Grid::default(),
             tempo_strength: 0.4,
             level_db: -18.0,
             clipping: false,
@@ -2366,10 +2403,11 @@ mod tests {
         let mut st = status();
         let v = View::build_with_touch(&st, Page::Settings, None, None);
         let q = v.settings.as_ref().unwrap();
-        assert_eq!(q.rows.len(), 3);
+        assert_eq!(q.rows.len(), 4);
         assert_eq!((q.rows[0].name, q.rows[0].value.as_str()), ("LEAD", "CH 10"));
         assert_eq!((q.rows[1].name, q.rows[1].value.as_str()), ("BASS", "CH 1"));
         assert_eq!((q.rows[2].name, q.rows[2].value.as_str()), ("DRUMS", "CH 10"));
+        assert_eq!((q.rows[3].name, q.rows[3].value.as_str()), ("NOTES", "LEAD 0 MS"));
         // a channel change shows up, and only that changes the view
         let mut seq = (*st.seq).clone();
         seq.apply(sequencer::SeqAction::Channel(Instrument::Lead, 2));
