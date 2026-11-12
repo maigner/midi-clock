@@ -19,7 +19,7 @@ are emitted before the hit is heard. See [PLAN.md](PLAN.md) for the rationale.
 | `crates/click` | Sample-accurate click rendered from the grid |
 | `crates/midiclock` | The 24 PPQN clock thread, Start/Stop, lateness statistics |
 | `crates/key` | Key detection from the room mic (long FFT, chroma, Krumhansl–Schmuckler key profiles, hysteresis) |
-| `crates/sequencer` | 16-step, 8-track pattern sequencer driven by the beat grid, MIDI notes out; keys, scales and the RANDOM / counterpoint generators |
+| `crates/sequencer` | 16-step, 8-track pattern sequencer driven by the beat grid, MIDI notes out; keys, scales and the counterpoint generator |
 | `crates/ui` | Touch-screen front end: framebuffer drawing, evdev touch, no window system |
 | `crates/app` | The `midi-clock` binary: threads, config, mode switching, status line |
 | `tools/clockgen` | Phase-1 tool: fixed-tempo clock + click, MIDI jitter and loopback latency measurement |
@@ -175,9 +175,9 @@ other tabs show nothing in the top bar but xruns:
   pentatonic, and blues. The notes of the key are bright in the root row.
   Tapping a root or a scale while on AUTO switches to MANUAL. The setting is
   saved with the patterns.
-- Once a key is known (heard with confidence, or set), the **RANDOM** and
-  **CNTRPT** buttons on the LEAD and BASS tabs come alive (see below); the
-  MIDI clock and the click do not care about the key.
+- Once a key is known (heard with confidence, or set), the **CNTRPT**
+  buttons on the LEAD and BASS tabs come alive (see below); the MIDI clock
+  and the click do not care about the key.
 - `[key]` in the config: `enabled`, `window_s`, `hold_s`, `profile`
   (`temperley` or `krumhansl`), `fmin_hz`/`fmax_hz`, `background_s`,
   `tuning_hz` (0 = estimate), `gate_dbfs`, `silence_reset_s`;
@@ -194,7 +194,7 @@ other tabs show nothing in the top bar but xruns:
   C1  ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □      8 tracks x 16 steps of the shown bar
   D1  □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □      playhead column highlighted
   ...
- [-] NOTE C1 [+]   [-] VEL 100 [+]   [RANDOM] [CNTRPT]
+ [-] NOTE C1 [+]   [-] VEL 100 [+]   [CLEAR] [CNTRPT]
 ```
 
 - Steps are 16ths of the bar; step 1 is the downbeat of the live grid, so the
@@ -231,13 +231,13 @@ other tabs show nothing in the top bar but xruns:
   of its steps there sets its end again. Tapping inside a note starts a new
   note on that step and cuts the old one; a drag stops short of the next
   note on the track.
-- **RANDOM** and **CNTRPT** write a new phrase in the key (they are grey
-  until a key is known; see the KEY tab). Both first make the eight tracks
-  the notes of the key upwards from the tonic at middle C, so the grid is a
-  diatonic piano roll, and clear the phrase. **RANDOM** then throws notes of
-  the key at the grid: a loose rhythm from 16ths to half notes with rests,
-  now and then a third or a fifth on top, velocities scattered around the
-  track's. **CNTRPT** composes a line by the rules of species counterpoint:
+- **CLEAR** takes every note out of the phrase, in all its bars. The
+  tracks' notes and the phrase length stay; there is no undo.
+- **CNTRPT** writes a new phrase in the key (it is grey until a key is
+  known; see the KEY tab). It first makes the eight tracks the notes of the
+  key upwards from the tonic at middle C, so the grid is a diatonic piano
+  roll, and clears the phrase. Then it composes a line by the rules of
+  species counterpoint:
   quarters and halves with a few eighths, ending on a long note; starts and
   ends on the tonic, the last step a leading tone or supertonic; mostly
   stepwise, leaps rare and answered by a step back, no sevenths, tritones
@@ -273,7 +273,7 @@ other tabs show nothing in the top bar but xruns:
  [▲] G1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   eight semitones, 16 steps of the shown bar
      ...                                    lowest note at the bottom
  [▼] C1  ■ □ □ ■ □ □ □ □ □ □ ■ □ □ □ □ □
- [-] VEL 100 [+]            [RANDOM] [CNTRPT]
+ [-] VEL 100 [+]            [CLEAR] [CNTRPT]
 ```
 
 - A single voice: each step holds one note or nothing, and a new note always
@@ -293,10 +293,11 @@ other tabs show nothing in the top bar but xruns:
   or its tail) and its velocity follows, the shade of the note shows it, as
   on the LEAD tab. **VEL** is the velocity new notes get; the MIDI channel
   is set on the SETUP tab.
-- **RANDOM** and **CNTRPT** write a new bass line in the key, as on the LEAD
-  tab: notes of the key in the octave up from the tonic (the tonic between
-  G0 and F#1; the window scrolls so it is the bottom row), and CNTRPT keeps
-  below and consonant with the lead where the lead's notes are in the key.
+- **CLEAR** empties the bass line, as on the LEAD tab. **CNTRPT** writes a
+  new bass line in the key: notes of the key in the octave up from the
+  tonic (the tonic between G0 and F#1; the window scrolls so it is the
+  bottom row), below and consonant with the lead where the lead's notes are
+  in the key.
   A line written with CNTRPT under a lead written with CNTRPT is two-part
   counterpoint; the other way round works too.
 - The bass line is saved in `sequencer.file` with the drum patterns.

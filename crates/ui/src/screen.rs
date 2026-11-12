@@ -12,7 +12,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Arc, Circle, CornerRadii, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
-use sequencer::{cover_map, drum_name, note_name, phrase_steps, BassParam, DrumParam, Instrument, Key, KeySetup, Param, Scale, SeqState, Style, BASS_ROWS, BASS_TOP, DRUMS, PITCH_NAMES, STEPS, TRACKS};
+use sequencer::{cover_map, drum_name, note_name, phrase_steps, BassParam, DrumParam, Instrument, Key, KeySetup, Param, Scale, SeqState, BASS_ROWS, BASS_TOP, DRUMS, PITCH_NAMES, STEPS, TRACKS};
 use tracker::{Grid, State};
 
 use crate::canvas::{Canvas, Scaled};
@@ -123,7 +123,9 @@ pub enum Button {
     KeyScale(Scale),
     // Lead and bass pages
     /// Write a new phrase in the key.
-    Generate(Instrument, Style),
+    Generate(Instrument),
+    /// Take every note out of the phrase.
+    Clear(Instrument),
     // Lead page
     /// Phrase length in bars.
     Bars(u8),
@@ -214,9 +216,9 @@ impl Button {
             | Button::StartStop
             | Button::One => Some(Page::Tempo),
             Button::KeyAuto | Button::KeyManual | Button::KeyRoot(_) | Button::KeyScale(_) => Some(Page::Key),
-            Button::Generate(Instrument::Lead, _) => Some(Page::Lead),
-            Button::Generate(Instrument::Bass, _) => Some(Page::Bass),
-            Button::Generate(Instrument::Drums, _) => Some(Page::Drums),
+            Button::Generate(Instrument::Lead) | Button::Clear(Instrument::Lead) => Some(Page::Lead),
+            Button::Generate(Instrument::Bass) | Button::Clear(Instrument::Bass) => Some(Page::Bass),
+            Button::Generate(Instrument::Drums) | Button::Clear(Instrument::Drums) => Some(Page::Drums),
             Button::Bars(_) | Button::Bar(_) | Button::BarLock | Button::ParamMinus(_) | Button::ParamPlus(_) => Some(Page::Lead),
             Button::BassBars(_) | Button::BassBar(_) | Button::BassBarLock | Button::BassMinus(_) | Button::BassPlus(_) | Button::BassScroll(_) => {
                 Some(Page::Bass)
@@ -288,7 +290,7 @@ const SEQ_PARAMS: [Param; 2] = [Param::Note, Param::Velocity];
 const BASS_PARAMS: [BassParam; 1] = [BassParam::Velocity];
 const DRUM_PARAMS: [DrumParam; 3] = [DrumParam::Note, DrumParam::Velocity, DrumParam::Swing];
 /// Groups along the bottom of the lead and bass pages: the parameters and,
-/// last, the RANDOM / CNTRPT pair.
+/// last, the CLEAR / CNTRPT pair.
 const SEQ_GROUPS: usize = SEQ_PARAMS.len() + 1;
 const BASS_GROUPS: usize = BASS_PARAMS.len() + 1;
 /// Pads per row.
@@ -995,7 +997,7 @@ impl Screen {
         buttons.push((Button::BarLock, r));
         buttons.push((Button::BassBarLock, r));
         buttons.push((Button::DrumBarLock, r));
-        // Parameters along the bottom of both pages, and the RANDOM /
+        // Parameters along the bottom of both pages, and the CLEAR /
         // CNTRPT pair in the last group.
         let gap = (m / 2).max(2);
         let yp = (h as f64 * 0.86) as i32;
@@ -1004,8 +1006,8 @@ impl Screen {
         let pm_w = group_w / 4;
         let gen_pair = |buttons: &mut Vec<(Button, Rectangle)>, inst: Instrument, gx: i32, gw: i32| {
             let half = (gw - gap) / 2;
-            buttons.push((Button::Generate(inst, Style::Random), rect(gx, yp, half, hp)));
-            buttons.push((Button::Generate(inst, Style::Counterpoint), rect(gx + gw - half, yp, half, hp)));
+            buttons.push((Button::Clear(inst), rect(gx, yp, half, hp)));
+            buttons.push((Button::Generate(inst), rect(gx + gw - half, yp, half, hp)));
         };
         // --- sequence page ---------------------------------------------------------
         let gy0 = by + bh + m;
@@ -1305,13 +1307,8 @@ impl Screen {
                     let label = if (sc.name().len() as i32) * 10 * s as i32 <= r.size.width as i32 - m { sc.name() } else { sc.short() };
                     (label.into(), key.and_then(|q| q.key).filter(|k| k.scale == *sc).map(|_| MANUAL))
                 }
-                Button::Generate(_, style) => {
-                    let (long, short) = match style {
-                        Style::Random => ("RANDOM", "RND"),
-                        Style::Counterpoint => ("CNTRPT", "CPT"),
-                    };
-                    (if 6 * 10 <= r.size.width as i32 - m { long } else { short }.into(), None)
-                }
+                Button::Generate(_) => (if 6 * 10 <= r.size.width as i32 - m { "CNTRPT" } else { "CPT" }.into(), None),
+                Button::Clear(_) => (if 5 * 10 <= r.size.width as i32 - m { "CLEAR" } else { "CLR" }.into(), None),
                 Button::ParamMinus(_) | Button::BassMinus(_) | Button::DrumMinus(_) | Button::ChannelMinus(_) | Button::NoteLeadMinus => ("-".into(), None),
                 Button::ParamPlus(_) | Button::BassPlus(_) | Button::DrumPlus(_) | Button::ChannelPlus(_) | Button::NoteLeadPlus => ("+".into(), None),
                 Button::BassScroll(_) => (String::new(), None),
@@ -1950,16 +1947,16 @@ mod tests {
             assert!(!matches!(s.hit(c.x, c.y, Page::Tempo), Some(Hit::Button(Button::KeyScale(_)))));
             let a = at(Button::KeyAuto);
             assert_eq!(a, at(Button::ModeAuto), "the key page's mode buttons sit where the tempo page's do");
-            // the generator pair at the right of the bottom row of the lead and bass pages
+            // CLEAR and the generator at the right of the bottom row of the lead and bass pages
             for inst in [Instrument::Lead, Instrument::Bass] {
-                let (rnd, cpt) = (at(Button::Generate(inst, Style::Random)), at(Button::Generate(inst, Style::Counterpoint)));
-                assert!(rnd.top_left.x + (rnd.size.width as i32) <= cpt.top_left.x && rnd.top_left.y == cpt.top_left.y);
+                let (clr, cpt) = (at(Button::Clear(inst)), at(Button::Generate(inst)));
+                assert!(clr.top_left.x + (clr.size.width as i32) <= cpt.top_left.x && clr.top_left.y == cpt.top_left.y);
                 assert_eq!(cpt.top_left.x + (cpt.size.width as i32), w as i32 - s.m, "{inst:?} pair does not reach the right edge at {w}x{h}");
-                assert!(3 * 10 <= rnd.size.width as i32 - s.m, "RND does not fit at {w}x{h}");
+                assert!(3 * 10 <= clr.size.width as i32 - s.m, "CLR does not fit at {w}x{h}");
             }
             let vp = at(Button::BassPlus(BassParam::Velocity));
-            let rnd = at(Button::Generate(Instrument::Bass, Style::Random));
-            assert!(vp.top_left.x + (vp.size.width as i32) <= rnd.top_left.x);
+            let clr = at(Button::Clear(Instrument::Bass));
+            assert!(vp.top_left.x + (vp.size.width as i32) <= clr.top_left.x);
             // settings: one row per instrument, name, -, readout, + across the width
             for (i, inst) in Instrument::all().enumerate() {
                 let (minus, plus) = (at(Button::ChannelMinus(inst)), at(Button::ChannelPlus(inst)));
@@ -2272,24 +2269,30 @@ mod tests {
         ses.touch(TouchEvent::Move { x, y: y + pitch, t: 7.1 }, Mode::Auto, &mut act);
         ses.touch(TouchEvent::Up { t: 7.2 }, Mode::Auto, &mut act);
         assert_eq!(got, vec![Action::Seq(BassScroll(1))]);
-        // the generator buttons are dead without a key and alive with one,
-        // seeded from the press time; the tempo buttons are gone in AUTO
+        // the generator button is dead without a key and alive with one,
+        // seeded from the press time; CLEAR needs no key; the tempo buttons
+        // are gone in AUTO
         got.clear();
         let mut act = |a: Action| got.push(a);
-        let rnd = screen.buttons.iter().find(|(b, _)| *b == Button::Generate(Instrument::Bass, Style::Random)).unwrap().1.center();
-        ses.touch(TouchEvent::Down { x: rnd.x, y: rnd.y, t: 8.0 }, Mode::Auto, &mut act);
+        let cpt = screen.buttons.iter().find(|(b, _)| *b == Button::Generate(Instrument::Bass)).unwrap().1.center();
+        ses.touch(TouchEvent::Down { x: cpt.x, y: cpt.y, t: 8.0 }, Mode::Auto, &mut act);
         ses.touch(TouchEvent::Up { t: 8.1 }, Mode::Auto, &mut act);
         assert_eq!(got, vec![]);
+        let mut act = |a: Action| got.push(a);
+        let clr = screen.buttons.iter().find(|(b, _)| *b == Button::Clear(Instrument::Bass)).unwrap().1.center();
+        ses.touch(TouchEvent::Down { x: clr.x, y: clr.y, t: 8.2 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Up { t: 8.3 }, Mode::Auto, &mut act);
+        assert_eq!(got, vec![Action::Seq(ClearPhrase(Instrument::Bass))]);
         let mut act = |a: Action| got.push(a);
         let st = Status { key: Some(heard(0, key::Mode::Major, 0.9)), ..st };
         ses.frame(st.now, &st, &mut act);
         got.clear();
         let mut act = |a: Action| got.push(a);
-        ses.touch(TouchEvent::Down { x: rnd.x, y: rnd.y, t: 8.5 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Down { x: cpt.x, y: cpt.y, t: 8.5 }, Mode::Auto, &mut act);
         ses.touch(TouchEvent::Up { t: 8.6 }, Mode::Auto, &mut act);
-        ses.touch(TouchEvent::Down { x: rnd.x, y: rnd.y, t: 8.9 }, Mode::Auto, &mut act);
+        ses.touch(TouchEvent::Down { x: cpt.x, y: cpt.y, t: 8.9 }, Mode::Auto, &mut act);
         ses.touch(TouchEvent::Up { t: 9.0 }, Mode::Auto, &mut act);
-        assert!(matches!(got[..], [Action::Generate(Instrument::Bass, Style::Random, a), Action::Generate(Instrument::Bass, Style::Random, b)] if a != b), "{got:?}");
+        assert!(matches!(got[..], [Action::Generate(Instrument::Bass, a), Action::Generate(Instrument::Bass, b)] if a != b), "{got:?}");
         got.clear();
         let mut act = |a: Action| got.push(a);
         ses.set_page(Page::Tempo);
@@ -2331,8 +2334,9 @@ mod tests {
         assert!(!Button::StartStop.visible(Mode::Auto, false) && Button::ModeManual.visible(Mode::Auto, true));
         assert!(!Button::KeyRoot(3).visible(Mode::Manual, true) && Button::KeyRoot(3).visible(Mode::Auto, false));
         assert!(Button::KeyAuto.visible(Mode::Auto, true) && Button::KeyManual.visible(Mode::Auto, false));
-        assert!(!Button::Generate(Instrument::Lead, Style::Random).enabled(Mode::Auto, true, false));
-        assert!(Button::Generate(Instrument::Bass, Style::Counterpoint).enabled(Mode::Manual, false, true));
+        assert!(!Button::Generate(Instrument::Lead).enabled(Mode::Auto, true, false));
+        assert!(Button::Generate(Instrument::Bass).enabled(Mode::Manual, false, true));
+        assert!(Button::Clear(Instrument::Lead).enabled(Mode::Auto, true, false));
         for (w, h) in [(1280usize, 800usize), (800, 480), (480, 320), (320, 240)] {
             let s = Screen::new(w, h);
             let mut c = Canvas::new(w, h, w * 4, PixelFormat::XRGB8888, Rotation::R0);

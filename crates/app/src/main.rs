@@ -802,12 +802,12 @@ fn main() -> Result<()> {
                                 manual.toggle(now);
                                 live.publish_manual(manual.grid());
                             }
-                            Action::Generate(inst, style, seed) => {
+                            Action::Generate(inst, seed) => {
                                 let heard = key_est.load_full();
                                 let k = ui::effective_key(&seq.borrow().key, (*heard).as_ref());
                                 if let Some(k) = k {
                                     let mut arc = seq.borrow_mut();
-                                    if Arc::make_mut(&mut arc).apply(sequencer::SeqAction::Generate(inst, style, k, seed)) {
+                                    if Arc::make_mut(&mut arc).apply(sequencer::SeqAction::Generate(inst, k, seed)) {
                                         seq_snapshot.store(Arc::new(arc.snapshot()));
                                         seq_dirty.set(Some(now));
                                     }

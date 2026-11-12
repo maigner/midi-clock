@@ -21,7 +21,7 @@ use rtio::{now, sleep_until, MidiOut};
 use serde::{Deserialize, Serialize};
 use tracker::Grid;
 
-pub use generate::{GenNote, Rng, Style, Voice};
+pub use generate::{GenNote, Rng, Voice};
 pub use theory::{Key, KeySetup, Scale, PITCH_NAMES};
 
 /// Tonic of a generated LEAD line: the lowest of the eight track notes is
@@ -473,11 +473,14 @@ pub enum SeqAction {
     KeyRoot(u8),
     /// KEY: the scale set by hand; switches to manual.
     KeyScale(Scale),
-    /// LEAD or BASS: write a new phrase in the key, at random or by the
-    /// counterpoint rules, from this seed. Replaces the phrase; on the
-    /// lead the eight tracks become the notes of the key up from the
-    /// tonic, on the bass the pitch window scrolls to the tonic.
-    Generate(Instrument, Style, Key, u64),
+    /// LEAD or BASS: write a new phrase in the key by the counterpoint
+    /// rules, from this seed. Replaces the phrase; on the lead the eight
+    /// tracks become the notes of the key up from the tonic, on the bass
+    /// the pitch window scrolls to the tonic.
+    Generate(Instrument, Key, u64),
+    /// LEAD or BASS: take every note out of the phrase. The tracks' notes
+    /// and the phrase length stay.
+    ClearPhrase(Instrument),
 }
 
 impl SeqAction {
@@ -1146,7 +1149,26 @@ impl SeqState {
                 self.key.key.scale = scale;
                 true
             }
-            SeqAction::Generate(inst, style, key, seed) => self.generate(inst, style, key, seed),
+            SeqAction::Generate(inst, key, seed) => self.generate(inst, key, seed),
+            SeqAction::ClearPhrase(inst) => {
+                self.drag = None;
+                match inst {
+                    Instrument::Lead => {
+                        for st in self.patterns[cur].tracks.iter_mut().flat_map(|tr| tr.steps.iter_mut()) {
+                            st.on = false;
+                        }
+                        self.selected_step = None;
+                        true
+                    }
+                    Instrument::Bass => {
+                        for st in &mut self.bass.steps {
+                            st.on = false;
+                        }
+                        true
+                    }
+                    Instrument::Drums => false,
+                }
+            }
         }
     }
 
@@ -1194,18 +1216,11 @@ impl SeqState {
     }
 
     /// `SeqAction::Generate`.
-    fn generate(&mut self, inst: Instrument, style: Style, key: Key, seed: u64) -> bool {
+    fn generate(&mut self, inst: Instrument, key: Key, seed: u64) -> bool {
         let mut rng = Rng::new(seed);
         self.drag = None;
-        // velocity of a generated note: by the beat for a composed line, by
-        // chance for a random one
-        let velocity = |base: u8, accent: i8, rng: &mut Rng| -> u8 {
-            let v = match style {
-                Style::Counterpoint => base as i32 + 12 * accent as i32,
-                Style::Random => base as i32 - 30 + rng.below(46) as i32,
-            };
-            v.clamp(1, 127) as u8
-        };
+        // velocity of a generated note: by the beat
+        let velocity = |base: u8, accent: i8| (base as i32 + 12 * accent as i32).clamp(1, 127) as u8;
         match inst {
             Instrument::Lead => {
                 let bass = self.bass_line();
@@ -1217,8 +1232,8 @@ impl SeqState {
                     return false;
                 }
                 let other: Vec<Option<u8>> = if in_key(&bass, key) { (0..n).map(|i| bass[i % bass.len()]).collect() } else { Vec::new() };
-                let v = Voice { pitches: &pitches, other: &other, above: true, polyphony: true };
-                let notes = generate::generate(style, key, &v, n, &mut rng);
+                let v = Voice { pitches: &pitches, other: &other, above: true };
+                let notes = generate::generate(key, &v, n, &mut rng);
                 for (t, tr) in p.tracks.iter_mut().enumerate().take(TRACKS) {
                     tr.note = pitches[t];
                     for st in tr.steps.iter_mut().take(n) {
@@ -1228,7 +1243,7 @@ impl SeqState {
                 for g in notes {
                     let Some(t) = pitches.iter().position(|&x| x == g.note) else { continue };
                     let tr = &mut p.tracks[t];
-                    let vel = velocity(tr.vel, g.accent, &mut rng);
+                    let vel = velocity(tr.vel, g.accent);
                     tr.steps[g.start] = Step { on: true, note: g.note, vel, len: g.len };
                 }
                 self.selected_step = None;
@@ -1244,8 +1259,8 @@ impl SeqState {
                     return false;
                 }
                 let other: Vec<Option<u8>> = if in_key(&lead, key) { (0..n).map(|i| lead[i % lead.len()]).collect() } else { Vec::new() };
-                let v = Voice { pitches: &pitches, other: &other, above: false, polyphony: false };
-                let notes = generate::generate(style, key, &v, n, &mut rng);
+                let v = Voice { pitches: &pitches, other: &other, above: false };
+                let notes = generate::generate(key, &v, n, &mut rng);
                 for st in b.steps.iter_mut().take(n) {
                     st.on = false;
                 }
@@ -1253,7 +1268,7 @@ impl SeqState {
                     if b.steps[g.start].on {
                         continue; // one voice: the first note on a step wins
                     }
-                    let vel = velocity(b.vel, g.accent, &mut rng);
+                    let vel = velocity(b.vel, g.accent);
                     b.steps[g.start] = BassStep { on: true, note: g.note, len: g.len, vel };
                 }
                 b.base = low.min(BASS_TOP);
@@ -2476,11 +2491,11 @@ mod tests {
         s.save(&path).unwrap();
         assert_eq!(SeqState::load(&path).unwrap().key, s.key);
         std::fs::remove_dir_all(&dir).unwrap();
-        // a random lead phrase: the tracks are the key's notes up from the
-        // tonic, every note in the key, inside the phrase
+        // a lead phrase: the tracks are the key's notes up from the tonic,
+        // every note in the key, inside the phrase
         let key = Key::new(9, Scale::Minor);
         s.apply(Bars(2));
-        assert!(s.apply(Generate(Instrument::Lead, Style::Random, key, 1)));
+        assert!(s.apply(Generate(Instrument::Lead, key, 1)));
         let p = s.pattern();
         assert_eq!(p.tracks.iter().map(|t| t.note).collect::<Vec<_>>(), vec![69, 71, 72, 74, 76, 77, 79, 81]);
         let mut count = 0;
@@ -2495,16 +2510,16 @@ mod tests {
                 }
             }
         }
-        assert!(count > 4, "{count} notes");
+        assert!(count >= 4, "{count} notes");
         // the same seed gives the same phrase, another seed a different one
         let mut s2 = s.clone();
-        s2.apply(Generate(Instrument::Lead, Style::Random, key, 1));
+        s2.apply(Generate(Instrument::Lead, key, 1));
         assert_eq!(s2.patterns, s.patterns);
-        s2.apply(Generate(Instrument::Lead, Style::Random, key, 2));
+        s2.apply(Generate(Instrument::Lead, key, 2));
         assert_ne!(s2.patterns, s.patterns);
         // a counterpoint bass line under it: in the key, one voice, the
         // window scrolled to the tonic, consonant with the lead where it sounds
-        assert!(s.apply(Generate(Instrument::Bass, Style::Counterpoint, key, 3)));
+        assert!(s.apply(Generate(Instrument::Bass, key, 3)));
         assert_eq!(s.bass.base, 33, "A0 at the bottom of the window");
         let lead = s.lead_line();
         let n = phrase_steps(s.bass.bars);
@@ -2521,7 +2536,7 @@ mod tests {
             }
         }
         // and a counterpoint lead over the bass, on the eight track notes
-        assert!(s.apply(Generate(Instrument::Lead, Style::Counterpoint, key, 4)));
+        assert!(s.apply(Generate(Instrument::Lead, key, 4)));
         let bass_line = s.bass_line();
         let p = s.pattern();
         let mut per_step = [0; 32];
@@ -2539,9 +2554,22 @@ mod tests {
         assert!(per_step.iter().all(|&c| c <= 1), "a composed line has one voice");
         assert_eq!(per_step[0], 1, "starts on the downbeat");
         // drums have no key
-        assert!(!s.apply(Generate(Instrument::Drums, Style::Random, key, 1)));
-        assert!(!Generate(Instrument::Lead, Style::Random, key, 1).view_only());
+        assert!(!s.apply(Generate(Instrument::Drums, key, 1)));
+        assert!(!Generate(Instrument::Lead, key, 1).view_only());
         assert!(!KeyRoot(1).view_only());
+        // CLEAR empties a phrase and leaves the rest as it is
+        let notes: Vec<u8> = s.pattern().tracks.iter().map(|t| t.note).collect();
+        let base = s.bass.base;
+        assert!(s.apply(ClearPhrase(Instrument::Lead)));
+        assert!(s.pattern().tracks.iter().all(|t| t.steps.iter().all(|st| !st.on)));
+        assert_eq!(s.pattern().tracks.iter().map(|t| t.note).collect::<Vec<_>>(), notes);
+        assert_eq!(s.pattern().bars, 2);
+        assert!(s.bass.steps.iter().any(|st| st.on), "the bass is another phrase");
+        assert!(s.apply(ClearPhrase(Instrument::Bass)));
+        assert!(s.bass.steps.iter().all(|st| !st.on));
+        assert_eq!(s.bass.base, base);
+        assert!(!s.apply(ClearPhrase(Instrument::Drums)), "the drums are cleared pad by pad");
+        assert!(!ClearPhrase(Instrument::Lead).view_only());
     }
 
     #[test]

@@ -1,6 +1,5 @@
-//! Writing a phrase in a key: notes thrown at the grid at random, or a line
-//! composed by the rules of species counterpoint, against the other voice
-//! if it has one.
+//! Writing a phrase in a key: a line composed by the rules of species
+//! counterpoint, against the other voice if it has one.
 //!
 //! The counterpoint rules, as taught (Fux, first and second species),
 //! reduced to a score per candidate note and a weighted draw, so that every
@@ -18,15 +17,6 @@
 //!   parallel fifths or octaves, contrary motion preferred, no crossing.
 
 use crate::theory::Key;
-
-/// What the RANDOM and CNTRPT buttons write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Style {
-    /// Notes of the key at random, a loose rhythm with rests.
-    Random,
-    /// A line by the counterpoint rules above.
-    Counterpoint,
-}
 
 /// A small deterministic generator (xorshift*), seeded from the tap time
 /// so a sequence can be reproduced in tests.
@@ -100,56 +90,17 @@ pub struct Voice<'a> {
     pub other: &'a [Option<u8>],
     /// This voice lies above the other one.
     pub above: bool,
-    /// The random style may put two notes on a step (a third or a fifth).
-    pub polyphony: bool,
 }
 
-/// Write a phrase of `n` steps.
-pub fn generate(style: Style, key: Key, v: &Voice, n: usize, rng: &mut Rng) -> Vec<GenNote> {
+/// Write a phrase of `n` steps: a line by the counterpoint rules above.
+pub fn generate(key: Key, v: &Voice, n: usize, rng: &mut Rng) -> Vec<GenNote> {
     if v.pitches.is_empty() || n == 0 {
         return Vec::new();
     }
-    let onsets = match style {
-        Style::Random => rhythm_random(n, rng),
-        Style::Counterpoint => rhythm_counterpoint(n, rng),
-    };
-    let pitches = match style {
-        Style::Random => onsets.iter().map(|_| v.pitches[rng.below(v.pitches.len())]).collect::<Vec<_>>(),
-        Style::Counterpoint => counterpoint_pitches(key, v, &onsets, rng),
-    };
+    let onsets = rhythm_counterpoint(n, rng);
+    let pitches = counterpoint_pitches(key, v, &onsets, rng);
     let accent = |start: usize| if start.is_multiple_of(16) { 1 } else if start.is_multiple_of(4) { 0 } else { -1 };
-    let mut out = Vec::with_capacity(onsets.len() + 4);
-    for (&(start, len), &note) in onsets.iter().zip(&pitches) {
-        out.push(GenNote { start, len, note, accent: accent(start) });
-        if style == Style::Random && v.polyphony && rng.unit() < 0.2 {
-            // a third or a fifth above, in the key
-            let i = v.pitches.iter().position(|&p| p == note).unwrap_or(0);
-            let j = i + if rng.unit() < 0.6 { 2 } else { 4 };
-            if let Some(&second) = v.pitches.get(j) {
-                out.push(GenNote { start, len, note: second, accent: accent(start) });
-            }
-        }
-    }
-    out
-}
-
-/// Note starts and lengths for the random style: a loose rhythm of
-/// 16ths to half notes with rests between.
-fn rhythm_random(n: usize, rng: &mut Rng) -> Vec<(usize, u16)> {
-    const LENS: [usize; 6] = [1, 2, 3, 4, 6, 8];
-    const W: [f64; 6] = [2.0, 4.0, 1.0, 3.0, 1.0, 1.0];
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos < n {
-        if !out.is_empty() && rng.unit() < 0.25 {
-            pos += 1 + rng.below(2);
-            continue;
-        }
-        let len = LENS[rng.weighted(&W)].min(n - pos);
-        out.push((pos, len as u16));
-        pos += len;
-    }
-    out
+    onsets.iter().zip(&pitches).map(|(&(start, len), &note)| GenNote { start, len, note, accent: accent(start) }).collect()
 }
 
 /// Note starts and lengths for a counterpoint line: bars of quarters,
@@ -394,27 +345,6 @@ mod tests {
         assert!(counts[2] > counts[0] * 2, "{counts:?}");
     }
 
-    #[test]
-    fn random_lines_stay_in_the_key_and_the_phrase() {
-        let key = Key::new(2, Scale::Dorian);
-        let pitches = key.notes_from_tonic(60, 8);
-        let v = Voice { pitches: &pitches, other: &[], above: true, polyphony: true };
-        for seed in seeds() {
-            let notes = generate(Style::Random, key, &v, 32, &mut Rng::new(seed));
-            assert!(!notes.is_empty());
-            for g in &notes {
-                assert!(key.contains(g.note) && pitches.contains(&g.note));
-                assert!(g.start < 32 && g.len >= 1 && g.start + g.len as usize <= 32, "{g:?}");
-            }
-            // notes on one step are different pitches
-            for (a, b) in notes.iter().zip(&notes[1..]) {
-                if a.start == b.start {
-                    assert_ne!(a.note, b.note);
-                }
-            }
-        }
-    }
-
     /// Melodic checks that every counterpoint line must pass.
     fn check_melody(key: Key, line: &[u8], pitches: &[u8]) {
         assert!(line.len() >= 2);
@@ -435,11 +365,11 @@ mod tests {
         for scale in [Scale::Major, Scale::Minor, Scale::Mixolydian, Scale::PentatonicMinor, Scale::HarmonicMinor] {
             let key = Key::new(7, scale);
             let pitches = key.notes_between(31, 43);
-            let v = Voice { pitches: &pitches, other: &[], above: false, polyphony: false };
+            let v = Voice { pitches: &pitches, other: &[], above: false };
             let mut steps_total = 0;
             let mut moves = 0;
             for seed in seeds() {
-                let notes = generate(Style::Counterpoint, key, &v, 64, &mut Rng::new(seed));
+                let notes = generate(key, &v, 64, &mut Rng::new(seed));
                 let line: Vec<u8> = notes.iter().map(|g| g.note).collect();
                 check_melody(key, &line, &pitches);
                 assert_eq!(notes[0].start, 0);
@@ -468,9 +398,9 @@ mod tests {
         let bass = [48u8, 55, 57, 53];
         let other: Vec<Option<u8>> = (0..64).map(|i| Some(bass[i / 16])).collect();
         let pitches = key.notes_from_tonic(60, 8);
-        let v = Voice { pitches: &pitches, other: &other, above: true, polyphony: false };
+        let v = Voice { pitches: &pitches, other: &other, above: true };
         for seed in seeds() {
-            let notes = generate(Style::Counterpoint, key, &v, 64, &mut Rng::new(seed));
+            let notes = generate(key, &v, 64, &mut Rng::new(seed));
             let line: Vec<u8> = notes.iter().map(|g| g.note).collect();
             check_melody(key, &line, &pitches);
             let mut prev: Option<(i32, i32, u8)> = None;
@@ -502,9 +432,9 @@ mod tests {
         let melody = [69u8, 71, 72, 74, 76, 74, 71, 69];
         let other: Vec<Option<u8>> = (0..32).map(|i| Some(melody[i / 4])).collect();
         let pitches = key.notes_between(33, 45);
-        let v = Voice { pitches: &pitches, other: &other, above: false, polyphony: false };
+        let v = Voice { pitches: &pitches, other: &other, above: false };
         for seed in seeds() {
-            let notes = generate(Style::Counterpoint, key, &v, 32, &mut Rng::new(seed));
+            let notes = generate(key, &v, 32, &mut Rng::new(seed));
             assert!(key.is_tonic(notes.last().unwrap().note));
             for (i, g) in notes.iter().enumerate() {
                 let o = other[g.start].unwrap();

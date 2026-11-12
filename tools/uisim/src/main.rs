@@ -356,9 +356,9 @@ fn apply(
                 *seq_dirty = Some(now);
             }
         }
-        Action::Generate(inst, style, seed) => {
+        Action::Generate(inst, seed) => {
             if let Some(k) = ui::effective_key(&seq.key, heard.as_ref()) {
-                if Arc::make_mut(seq).apply(sequencer::SeqAction::Generate(inst, style, k, seed)) {
+                if Arc::make_mut(seq).apply(sequencer::SeqAction::Generate(inst, k, seed)) {
                     seq_snapshot.store(Arc::new(seq.snapshot()));
                     *seq_dirty = Some(now);
                 }

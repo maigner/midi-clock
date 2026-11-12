@@ -14,7 +14,7 @@ use embedded_graphics::prelude::DrawTarget;
 
 pub use canvas::{Canvas, PixelFormat, Rotation};
 pub use screen::{effective_key, Button, Hit, Mode, Page, Screen, Status, View, KEY_MIN_CONFIDENCE};
-pub use sequencer::{Instrument, SeqAction, Style};
+pub use sequencer::{Instrument, SeqAction};
 pub use touch::{TouchConfig, TouchEvent};
 
 #[derive(Clone, Debug)]
@@ -58,9 +58,8 @@ pub enum Action {
     Nudge(f64),
     ToggleRun,
     /// Write a new LEAD or BASS phrase in the key in effect (the
-    /// application knows it), at random or by the counterpoint rules,
-    /// from this seed.
-    Generate(Instrument, Style, u64),
+    /// application knows it) by the counterpoint rules, from this seed.
+    Generate(Instrument, u64),
     Seq(SeqAction),
 }
 
@@ -485,7 +484,8 @@ fn dispatch(b: Button, t: f64, act: &mut impl FnMut(Action)) {
         Button::KeyRoot(pc) => Action::Seq(SeqAction::KeyRoot(pc)),
         Button::KeyScale(sc) => Action::Seq(SeqAction::KeyScale(sc)),
         // the press time is the seed: every press writes a different phrase
-        Button::Generate(inst, style) => Action::Generate(inst, style, t.to_bits()),
+        Button::Generate(inst) => Action::Generate(inst, t.to_bits()),
+        Button::Clear(inst) => Action::Seq(SeqAction::ClearPhrase(inst)),
         Button::ParamMinus(p) => Action::Seq(SeqAction::Adjust(p, -1)),
         Button::ParamPlus(p) => Action::Seq(SeqAction::Adjust(p, 1)),
         Button::Bars(n) => Action::Seq(SeqAction::Bars(n)),
