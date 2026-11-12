@@ -21,7 +21,7 @@ use rtio::{now, sleep_until, MidiOut};
 use serde::{Deserialize, Serialize};
 use tracker::Grid;
 
-pub use generate::{GenNote, Rng, Voice};
+pub use generate::{GenNote, Rhythm, Rng, Voice};
 pub use theory::{Key, KeySetup, Scale, PITCH_NAMES};
 
 /// Tonic of a generated LEAD line: the lowest of the eight track notes is
@@ -474,9 +474,10 @@ pub enum SeqAction {
     /// KEY: the scale set by hand; switches to manual.
     KeyScale(Scale),
     /// LEAD or BASS: write a new phrase in the key by the counterpoint
-    /// rules, from this seed. Replaces the phrase; on the lead the eight
-    /// tracks become the notes of the key up from the tonic, on the bass
-    /// the pitch window scrolls to the tonic.
+    /// rules, from this seed, in the instrument's next rhythm (which then
+    /// moves on). Replaces the phrase; on the lead the eight tracks become
+    /// the notes of the key up from the tonic, on the bass the pitch
+    /// window scrolls to the tonic.
     Generate(Instrument, Key, u64),
     /// LEAD or BASS: take every note out of the phrase. The tracks' notes
     /// and the phrase length stay.
@@ -550,6 +551,11 @@ pub struct SeqState {
     pub drum_arm: DrumArm,
     /// Pad taps are written to the phrase while the clock runs.
     pub drum_rec: bool,
+    /// The rhythm the next generated lead phrase gets; every one written
+    /// moves it on, so repeated presses go through them all.
+    pub lead_rhythm: Rhythm,
+    /// The same for the bass line.
+    pub bass_rhythm: Rhythm,
     /// The KEY page: auto or by hand, and the key set by hand.
     pub key: KeySetup,
     /// Extra lead for every note in ms (SETUP page), `NOTE_LEAD_RANGE`.
@@ -600,6 +606,8 @@ impl Default for SeqState {
             drum_bar_lock: false,
             drum_arm: DrumArm::Off,
             drum_rec: false,
+            lead_rhythm: Rhythm::default(),
+            bass_rhythm: Rhythm::default(),
             key: KeySetup::default(),
             note_lead_ms: 0,
             hit: None,
@@ -1233,7 +1241,7 @@ impl SeqState {
                 }
                 let other: Vec<Option<u8>> = if in_key(&bass, key) { (0..n).map(|i| bass[i % bass.len()]).collect() } else { Vec::new() };
                 let v = Voice { pitches: &pitches, other: &other, above: true };
-                let notes = generate::generate(key, &v, n, &mut rng);
+                let notes = generate::generate(self.lead_rhythm, key, &v, n, &mut rng);
                 for (t, tr) in p.tracks.iter_mut().enumerate().take(TRACKS) {
                     tr.note = pitches[t];
                     for st in tr.steps.iter_mut().take(n) {
@@ -1247,6 +1255,7 @@ impl SeqState {
                     tr.steps[g.start] = Step { on: true, note: g.note, vel, len: g.len };
                 }
                 self.selected_step = None;
+                self.lead_rhythm = self.lead_rhythm.next();
                 true
             }
             Instrument::Bass => {
@@ -1260,7 +1269,7 @@ impl SeqState {
                 }
                 let other: Vec<Option<u8>> = if in_key(&lead, key) { (0..n).map(|i| lead[i % lead.len()]).collect() } else { Vec::new() };
                 let v = Voice { pitches: &pitches, other: &other, above: false };
-                let notes = generate::generate(key, &v, n, &mut rng);
+                let notes = generate::generate(self.bass_rhythm, key, &v, n, &mut rng);
                 for st in b.steps.iter_mut().take(n) {
                     st.on = false;
                 }
@@ -1272,6 +1281,7 @@ impl SeqState {
                     b.steps[g.start] = BassStep { on: true, note: g.note, len: g.len, vel };
                 }
                 b.base = low.min(BASS_TOP);
+                self.bass_rhythm = self.bass_rhythm.next();
                 true
             }
             Instrument::Drums => false,
@@ -2495,6 +2505,7 @@ mod tests {
         // every note in the key, inside the phrase
         let key = Key::new(9, Scale::Minor);
         s.apply(Bars(2));
+        let before = s.clone();
         assert!(s.apply(Generate(Instrument::Lead, key, 1)));
         let p = s.pattern();
         assert_eq!(p.tracks.iter().map(|t| t.note).collect::<Vec<_>>(), vec![69, 71, 72, 74, 76, 77, 79, 81]);
@@ -2512,11 +2523,24 @@ mod tests {
         }
         assert!(count >= 4, "{count} notes");
         // the same seed gives the same phrase, another seed a different one
-        let mut s2 = s.clone();
+        let mut s2 = before.clone();
         s2.apply(Generate(Instrument::Lead, key, 1));
         assert_eq!(s2.patterns, s.patterns);
+        let mut s2 = before.clone();
         s2.apply(Generate(Instrument::Lead, key, 2));
         assert_ne!(s2.patterns, s.patterns);
+        // every press moves on to the next rhythm, each instrument on its
+        // own: quarters and halves first, then groups of three
+        assert_eq!((s.lead_rhythm, s.bass_rhythm), (Rhythm::Threes, Rhythm::Straight));
+        let lens = |s: &SeqState| -> Vec<u16> { s.pattern().tracks.iter().flat_map(|t| t.steps.iter().filter(|st| st.on).map(|st| st.len)).collect() };
+        assert!(lens(&s).iter().all(|l| l % 2 == 0), "{:?}", lens(&s));
+        let mut s2 = s.clone();
+        s2.apply(Generate(Instrument::Lead, key, 1));
+        assert!(lens(&s2).iter().any(|&l| l == 3 || l == 6), "{:?}", lens(&s2));
+        for _ in 0..3 {
+            s2.apply(Generate(Instrument::Lead, key, 1));
+        }
+        assert_eq!(s2.lead_rhythm, Rhythm::Threes, "round and round");
         // a counterpoint bass line under it: in the key, one voice, the
         // window scrolled to the tonic, consonant with the lead where it sounds
         assert!(s.apply(Generate(Instrument::Bass, key, 3)));

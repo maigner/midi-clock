@@ -175,7 +175,7 @@ other tabs show nothing in the top bar but xruns:
   pentatonic, and blues. The notes of the key are bright in the root row.
   Tapping a root or a scale while on AUTO switches to MANUAL. The setting is
   saved with the patterns.
-- Once a key is known (heard with confidence, or set), the **CNTRPT**
+- Once a key is known (heard with confidence, or set), the **CPT**
   buttons on the LEAD and BASS tabs come alive (see below); the MIDI clock
   and the click do not care about the key.
 - `[key]` in the config: `enabled`, `window_s`, `hold_s`, `profile`
@@ -194,7 +194,7 @@ other tabs show nothing in the top bar but xruns:
   C1  ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □      8 tracks x 16 steps of the shown bar
   D1  □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □      playhead column highlighted
   ...
- [-] NOTE C1 [+]   [-] VEL 100 [+]   [CLEAR] [CNTRPT]
+ [-] NOTE C1 [+]   [-] VEL 100 [+]   [CLEAR] [CPT 4]
 ```
 
 - Steps are 16ths of the bar; step 1 is the downbeat of the live grid, so the
@@ -233,12 +233,11 @@ other tabs show nothing in the top bar but xruns:
   note on the track.
 - **CLEAR** takes every note out of the phrase, in all its bars. The
   tracks' notes and the phrase length stay; there is no undo.
-- **CNTRPT** writes a new phrase in the key (it is grey until a key is
+- **CPT** writes a new phrase in the key (it is grey until a key is
   known; see the KEY tab). It first makes the eight tracks the notes of the
   key upwards from the tonic at middle C, so the grid is a diatonic piano
   roll, and clears the phrase. Then it composes a line by the rules of
-  species counterpoint:
-  quarters and halves with a few eighths, ending on a long note; starts and
+  species counterpoint: it starts and
   ends on the tonic, the last step a leading tone or supertonic; mostly
   stepwise, leaps rare and answered by a step back, no sevenths, tritones
   or repeated notes, one climax; and, when the bass line is in the key, only
@@ -246,6 +245,15 @@ other tabs show nothing in the top bar but xruns:
   preferred, no parallel fifths or octaves, contrary motion preferred, no
   crossing. Velocities follow the beat (downbeat loudest). Every press gives
   a different line; nothing is undone but the phrase it replaces.
+- The rhythm of the line changes with every press, and the number on the
+  button says which one the next press writes, round and round: **CPT 4**
+  quarters and halves with a few eighths; **CPT 3** groups of three 16ths
+  (3+3+2, 3+3+3+3+4, 6+6+4); **CPT 5** groups of five (5+5+6, 5+5+3+3,
+  5+3+5+3); **CPT 7** groups of seven (7+7+2, 7+9, or the seven split
+  3+4). In phrases of four bars or more a grouping can also run across a
+  bar line (ten threes and a two over two bars, six fives and a two, four
+  sevens and a four). The last bar always ends on a long note. LEAD and
+  BASS count their presses separately.
 - The sequencer state also has play/mute, per-step editing and four patterns
   (`A`-`D`), but the screen has no buttons for them yet; pattern A is used.
 - Default tracks are General MIDI drums on channel 10 (kick, snare, hats,
@@ -273,7 +281,7 @@ other tabs show nothing in the top bar but xruns:
  [▲] G1  □ □ □ □ □ □ □ □ □ □ □ □ □ □ □ □   eight semitones, 16 steps of the shown bar
      ...                                    lowest note at the bottom
  [▼] C1  ■ □ □ ■ □ □ □ □ □ □ ■ □ □ □ □ □
- [-] VEL 100 [+]            [CLEAR] [CNTRPT]
+ [-] VEL 100 [+]            [CLEAR] [CPT 4]
 ```
 
 - A single voice: each step holds one note or nothing, and a new note always
@@ -293,12 +301,12 @@ other tabs show nothing in the top bar but xruns:
   or its tail) and its velocity follows, the shade of the note shows it, as
   on the LEAD tab. **VEL** is the velocity new notes get; the MIDI channel
   is set on the SETUP tab.
-- **CLEAR** empties the bass line, as on the LEAD tab. **CNTRPT** writes a
-  new bass line in the key: notes of the key in the octave up from the
-  tonic (the tonic between G0 and F#1; the window scrolls so it is the
-  bottom row), below and consonant with the lead where the lead's notes are
-  in the key.
-  A line written with CNTRPT under a lead written with CNTRPT is two-part
+- **CLEAR** empties the bass line, as on the LEAD tab. **CPT** writes a
+  new bass line in the key, in the rhythm its number names: notes of the
+  key in the octave up from the tonic (the tonic between G0 and F#1; the
+  window scrolls so it is the bottom row), below and consonant with the
+  lead where the lead's notes are in the key.
+  A line written with CPT under a lead written with CPT is two-part
   counterpoint; the other way round works too.
 - The bass line is saved in `sequencer.file` with the drum patterns.
 

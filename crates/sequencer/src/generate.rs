@@ -1,5 +1,7 @@
 //! Writing a phrase in a key: a line composed by the rules of species
-//! counterpoint, against the other voice if it has one.
+//! counterpoint, against the other voice if it has one. The rules choose
+//! the pitches; the rhythm is one of several (`Rhythm`), from quarters and
+//! halves to groups of three, five and seven 16ths.
 //!
 //! The counterpoint rules, as taught (Fux, first and second species),
 //! reduced to a score per candidate note and a weighted draw, so that every
@@ -17,6 +19,45 @@
 //!   parallel fifths or octaves, contrary motion preferred, no crossing.
 
 use crate::theory::Key;
+
+/// How the notes of a generated line are grouped. The CPT button moves
+/// on to the next rhythm with every press.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rhythm {
+    /// Quarters and halves with a few eighths.
+    #[default]
+    Straight,
+    /// Groups of three 16ths: 3+3+2 and its relatives.
+    Threes,
+    /// Groups of five: 5+5+6, 5+5+3+3.
+    Fives,
+    /// Groups of seven: 7+7+2, or the seven split 3+4.
+    Sevens,
+}
+
+impl Rhythm {
+    pub const ALL: [Rhythm; 4] = [Rhythm::Straight, Rhythm::Threes, Rhythm::Fives, Rhythm::Sevens];
+
+    /// The rhythm after this one, round and round.
+    pub fn next(self) -> Rhythm {
+        match self {
+            Rhythm::Straight => Rhythm::Threes,
+            Rhythm::Threes => Rhythm::Fives,
+            Rhythm::Fives => Rhythm::Sevens,
+            Rhythm::Sevens => Rhythm::Straight,
+        }
+    }
+
+    /// The size of its groups in 16ths: what the button shows.
+    pub fn group(self) -> u8 {
+        match self {
+            Rhythm::Straight => 4,
+            Rhythm::Threes => 3,
+            Rhythm::Fives => 5,
+            Rhythm::Sevens => 7,
+        }
+    }
+}
 
 /// A small deterministic generator (xorshift*), seeded from the tap time
 /// so a sequence can be reproduced in tests.
@@ -92,39 +133,122 @@ pub struct Voice<'a> {
     pub above: bool,
 }
 
-/// Write a phrase of `n` steps: a line by the counterpoint rules above.
-pub fn generate(key: Key, v: &Voice, n: usize, rng: &mut Rng) -> Vec<GenNote> {
+/// Write a phrase of `n` steps: a line by the counterpoint rules above, its
+/// notes grouped as `rhythm` says.
+pub fn generate(rhythm: Rhythm, key: Key, v: &Voice, n: usize, rng: &mut Rng) -> Vec<GenNote> {
     if v.pitches.is_empty() || n == 0 {
         return Vec::new();
     }
-    let onsets = rhythm_counterpoint(n, rng);
+    let onsets = rhythm_counterpoint(rhythm, n, rng);
     let pitches = counterpoint_pitches(key, v, &onsets, rng);
     let accent = |start: usize| if start.is_multiple_of(16) { 1 } else if start.is_multiple_of(4) { 0 } else { -1 };
     onsets.iter().zip(&pitches).map(|(&(start, len), &note)| GenNote { start, len, note, accent: accent(start) }).collect()
 }
 
-/// Note starts and lengths for a counterpoint line: bars of quarters,
-/// halves and a few eighths, the last bar ending on a long note.
-fn rhythm_counterpoint(n: usize, rng: &mut Rng) -> Vec<(usize, u16)> {
-    const BAR: &[(&[u16], f64)] = &[
-        (&[4, 4, 4, 4], 4.0),
-        (&[8, 4, 4], 2.0),
-        (&[4, 4, 8], 2.0),
-        (&[8, 8], 1.0),
-        (&[4, 2, 2, 4, 4], 1.5),
-        (&[2, 2, 4, 4, 4], 1.0),
-        (&[4, 4, 2, 2, 4], 1.5),
-        (&[4, 4, 4, 2, 2], 1.0),
-        (&[6, 2, 4, 4], 1.0),
-        (&[4, 2, 2, 8], 1.0),
-    ];
-    const LAST: &[(&[u16], f64)] = &[(&[4, 4, 8], 3.0), (&[8, 8], 2.0), (&[4, 12], 1.0), (&[2, 2, 4, 8], 1.0), (&[4, 4, 4, 4], 1.0)];
+/// Note lengths in 16ths that fill one bar, or two where a grouping runs
+/// across the bar line, and how often the pattern is drawn.
+type Pattern = (&'static [u16], f64);
+
+impl Rhythm {
+    /// The patterns a phrase is made of, and those for its last bar: one
+    /// bar each, ending on a long note.
+    fn patterns(self) -> (&'static [Pattern], &'static [Pattern]) {
+        match self {
+            Rhythm::Straight => (
+                &[
+                    (&[4, 4, 4, 4], 4.0),
+                    (&[8, 4, 4], 2.0),
+                    (&[4, 4, 8], 2.0),
+                    (&[8, 8], 1.0),
+                    (&[4, 2, 2, 4, 4], 1.5),
+                    (&[2, 2, 4, 4, 4], 1.0),
+                    (&[4, 4, 2, 2, 4], 1.5),
+                    (&[4, 4, 4, 2, 2], 1.0),
+                    (&[6, 2, 4, 4], 1.0),
+                    (&[4, 2, 2, 8], 1.0),
+                    (&[6, 2, 6, 2], 1.0),
+                    (&[2, 4, 2, 4, 4], 1.0),
+                    (&[4, 2, 4, 2, 4], 1.0),
+                ],
+                &[(&[4, 4, 8], 3.0), (&[8, 8], 2.0), (&[4, 12], 1.0), (&[2, 2, 4, 8], 1.0), (&[4, 4, 4, 4], 1.0)],
+            ),
+            Rhythm::Threes => (
+                &[
+                    (&[3, 3, 2, 3, 3, 2], 3.0),
+                    (&[3, 3, 3, 3, 4], 3.0),
+                    (&[3, 3, 3, 3, 2, 2], 2.0),
+                    (&[6, 6, 4], 2.0),
+                    (&[3, 3, 2, 4, 4], 1.5),
+                    (&[4, 4, 3, 3, 2], 1.5),
+                    (&[6, 3, 3, 4], 1.0),
+                    (&[3, 3, 4, 3, 3], 1.0),
+                    (&[2, 3, 3, 3, 3, 2], 1.0),
+                    // threes across the bar line
+                    (&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2], 2.5),
+                    (&[3, 3, 3, 3, 3, 3, 3, 3, 4, 4], 1.5),
+                    (&[6, 6, 6, 6, 6, 2], 1.0),
+                    (&[6, 6, 6, 6, 3, 3, 2], 1.0),
+                ],
+                &[(&[3, 3, 2, 8], 3.0), (&[3, 3, 10], 2.0), (&[6, 6, 4], 1.5), (&[3, 3, 3, 3, 4], 1.0), (&[6, 10], 1.0), (&[3, 3, 2, 3, 5], 1.0)],
+            ),
+            Rhythm::Fives => (
+                &[
+                    (&[5, 5, 6], 3.0),
+                    (&[5, 5, 3, 3], 3.0),
+                    (&[5, 3, 5, 3], 2.0),
+                    (&[3, 5, 3, 5], 1.5),
+                    (&[3, 3, 5, 5], 1.5),
+                    (&[5, 6, 5], 1.5),
+                    (&[6, 5, 5], 1.0),
+                    (&[5, 3, 3, 5], 1.0),
+                    (&[5, 5, 2, 2, 2], 1.0),
+                    (&[5, 5, 4, 2], 1.0),
+                    // fives across the bar line
+                    (&[5, 5, 5, 5, 5, 5, 2], 2.5),
+                    (&[5, 5, 5, 5, 6, 6], 1.5),
+                    (&[5, 5, 3, 5, 5, 3, 3, 3], 1.5),
+                    (&[5, 5, 5, 5, 5, 3, 4], 1.0),
+                ],
+                &[(&[5, 5, 6], 3.0), (&[5, 3, 8], 2.0), (&[3, 5, 8], 1.0), (&[5, 11], 1.0), (&[5, 5, 2, 4], 1.0)],
+            ),
+            Rhythm::Sevens => (
+                &[
+                    (&[7, 7, 2], 3.0),
+                    (&[3, 4, 3, 4, 2], 2.5),
+                    (&[4, 3, 4, 3, 2], 2.0),
+                    (&[7, 5, 4], 2.0),
+                    (&[7, 9], 1.5),
+                    (&[7, 3, 3, 3], 1.5),
+                    (&[4, 7, 5], 1.0),
+                    (&[2, 7, 7], 1.0),
+                    (&[7, 4, 5], 1.0),
+                    (&[3, 4, 7, 2], 1.0),
+                    // sevens across the bar line
+                    (&[7, 7, 7, 7, 4], 2.5),
+                    (&[3, 4, 3, 4, 3, 4, 3, 4, 4], 2.0),
+                    (&[7, 7, 7, 4, 7], 1.0),
+                    (&[7, 7, 7, 7, 2, 2], 1.0),
+                ],
+                &[(&[7, 9], 3.0), (&[3, 4, 9], 2.0), (&[4, 3, 9], 1.0), (&[7, 3, 6], 1.0), (&[7, 2, 7], 1.0)],
+            ),
+        }
+    }
+}
+
+/// Note starts and lengths for a counterpoint line: patterns of the rhythm
+/// one after the other, the last bar ending on a long note.
+fn rhythm_counterpoint(rhythm: Rhythm, n: usize, rng: &mut Rng) -> Vec<(usize, u16)> {
+    let (body, last) = rhythm.patterns();
+    let steps = |pattern: &[u16]| pattern.iter().map(|&l| l as usize).sum::<usize>();
     let bars = (n / 16).max(1);
     let mut out = Vec::new();
     let mut pos = 0;
-    for bar in 0..bars {
-        let table = if bar + 1 == bars { LAST } else { BAR };
-        let w: Vec<f64> = table.iter().map(|(_, w)| *w).collect();
+    let mut bar = 0;
+    while bar < bars {
+        // bars to fill before the last one: a pattern must not run into it
+        let room = (bars - 1 - bar) * 16;
+        let table = if room == 0 { last } else { body };
+        let w: Vec<f64> = table.iter().map(|(p, w)| if room == 0 || steps(p) <= room { *w } else { 0.0 }).collect();
         let pattern = table[rng.weighted(&w)].0;
         for &len in pattern {
             if pos >= n {
@@ -134,6 +258,7 @@ fn rhythm_counterpoint(n: usize, rng: &mut Rng) -> Vec<(usize, u16)> {
             out.push((pos, len as u16));
             pos += len;
         }
+        bar += (steps(pattern) / 16).max(1);
     }
     if out.is_empty() {
         out.push((0, n.min(16) as u16));
@@ -361,15 +486,72 @@ mod tests {
     }
 
     #[test]
+    fn every_pattern_fills_its_bars() {
+        for r in Rhythm::ALL {
+            let (body, last) = r.patterns();
+            for (p, w) in body {
+                let n: u16 = p.iter().sum();
+                assert!(n == 16 || n == 32, "{r:?} {p:?} is {n} steps");
+                assert!(*w > 0.0 && p.iter().all(|&l| l >= 2));
+            }
+            assert!(body.iter().any(|(p, _)| p.iter().sum::<u16>() == 16), "{r:?}: nothing for a single bar");
+            for (p, _) in last {
+                assert_eq!(p.iter().sum::<u16>(), 16, "{r:?} {p:?}");
+                assert!(*p.last().unwrap() >= 4, "{r:?} {p:?} does not end on a long note");
+            }
+            assert_eq!(Rhythm::ALL.iter().filter(|x| x.group() == r.group()).count(), 1);
+        }
+        let mut r = Rhythm::default();
+        for want in Rhythm::ALL {
+            assert_eq!(r, want);
+            r = r.next();
+        }
+        assert_eq!(r, Rhythm::default(), "round and round");
+    }
+
+    #[test]
+    fn rhythms_cover_the_phrase_in_their_groups() {
+        for r in Rhythm::ALL {
+            for bars in [1usize, 2, 4, 8] {
+                let n = bars * 16;
+                let mut across = false;
+                for seed in seeds() {
+                    let onsets = rhythm_counterpoint(r, n, &mut Rng::new(seed));
+                    let mut pos = 0;
+                    for &(start, len) in &onsets {
+                        assert_eq!(start, pos, "{r:?} {onsets:?}");
+                        pos += len as usize;
+                    }
+                    assert_eq!(pos, n, "{r:?} {onsets:?}");
+                    // the last bar begins on its downbeat and ends long
+                    assert!(onsets.iter().any(|&(s, _)| s == n - 16), "{r:?} {onsets:?}");
+                    assert!(onsets.last().unwrap().1 >= 4);
+                    let lens: Vec<u16> = onsets.iter().map(|o| o.1).collect();
+                    let grouped = match r {
+                        Rhythm::Straight => lens.iter().all(|l| l % 2 == 0),
+                        Rhythm::Threes => lens.iter().any(|&l| l == 3 || l == 6),
+                        Rhythm::Fives => lens.contains(&5),
+                        Rhythm::Sevens => lens.contains(&7) || lens.windows(2).any(|w| w[0] + w[1] == 7),
+                    };
+                    assert!(grouped, "{r:?} {lens:?}");
+                    across |= onsets.iter().any(|&(s, l)| s % 16 != 0 && (s % 16) + l as usize > 16);
+                }
+                // with room for it, a grouping sometimes runs over a bar line
+                assert_eq!(across, r != Rhythm::Straight && bars >= 4, "{r:?} in {bars} bars");
+            }
+        }
+    }
+
+    #[test]
     fn counterpoint_alone_is_a_cantus_firmus() {
-        for scale in [Scale::Major, Scale::Minor, Scale::Mixolydian, Scale::PentatonicMinor, Scale::HarmonicMinor] {
+        for (scale, rhythm) in [Scale::Major, Scale::Minor, Scale::Mixolydian, Scale::PentatonicMinor, Scale::HarmonicMinor].into_iter().zip(Rhythm::ALL.into_iter().cycle()) {
             let key = Key::new(7, scale);
             let pitches = key.notes_between(31, 43);
             let v = Voice { pitches: &pitches, other: &[], above: false };
             let mut steps_total = 0;
             let mut moves = 0;
             for seed in seeds() {
-                let notes = generate(key, &v, 64, &mut Rng::new(seed));
+                let notes = generate(rhythm, key, &v, 64, &mut Rng::new(seed));
                 let line: Vec<u8> = notes.iter().map(|g| g.note).collect();
                 check_melody(key, &line, &pitches);
                 assert_eq!(notes[0].start, 0);
@@ -399,8 +581,8 @@ mod tests {
         let other: Vec<Option<u8>> = (0..64).map(|i| Some(bass[i / 16])).collect();
         let pitches = key.notes_from_tonic(60, 8);
         let v = Voice { pitches: &pitches, other: &other, above: true };
-        for seed in seeds() {
-            let notes = generate(key, &v, 64, &mut Rng::new(seed));
+        for (seed, rhythm) in seeds().flat_map(|s| Rhythm::ALL.map(|r| (s, r))) {
+            let notes = generate(rhythm, key, &v, 64, &mut Rng::new(seed));
             let line: Vec<u8> = notes.iter().map(|g| g.note).collect();
             check_melody(key, &line, &pitches);
             let mut prev: Option<(i32, i32, u8)> = None;
@@ -433,8 +615,8 @@ mod tests {
         let other: Vec<Option<u8>> = (0..32).map(|i| Some(melody[i / 4])).collect();
         let pitches = key.notes_between(33, 45);
         let v = Voice { pitches: &pitches, other: &other, above: false };
-        for seed in seeds() {
-            let notes = generate(key, &v, 32, &mut Rng::new(seed));
+        for (seed, rhythm) in seeds().flat_map(|s| Rhythm::ALL.map(|r| (s, r))) {
+            let notes = generate(rhythm, key, &v, 32, &mut Rng::new(seed));
             assert!(key.is_tonic(notes.last().unwrap().note));
             for (i, g) in notes.iter().enumerate() {
                 let o = other[g.start].unwrap();

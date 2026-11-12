@@ -12,7 +12,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Arc, Circle, CornerRadii, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, Triangle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 
-use sequencer::{cover_map, drum_name, note_name, phrase_steps, BassParam, DrumParam, Instrument, Key, KeySetup, Param, Scale, SeqState, BASS_ROWS, BASS_TOP, DRUMS, PITCH_NAMES, STEPS, TRACKS};
+use sequencer::{cover_map, drum_name, note_name, phrase_steps, BassParam, DrumParam, Instrument, Key, KeySetup, Param, Rhythm, Scale, SeqState, BASS_ROWS, BASS_TOP, DRUMS, PITCH_NAMES, STEPS, TRACKS};
 use tracker::{Grid, State};
 
 use crate::canvas::{Canvas, Scaled};
@@ -290,7 +290,7 @@ const SEQ_PARAMS: [Param; 2] = [Param::Note, Param::Velocity];
 const BASS_PARAMS: [BassParam; 1] = [BassParam::Velocity];
 const DRUM_PARAMS: [DrumParam; 3] = [DrumParam::Note, DrumParam::Velocity, DrumParam::Swing];
 /// Groups along the bottom of the lead and bass pages: the parameters and,
-/// last, the CLEAR / CNTRPT pair.
+/// last, the CLEAR / CPT pair.
 const SEQ_GROUPS: usize = SEQ_PARAMS.len() + 1;
 const BASS_GROUPS: usize = BASS_PARAMS.len() + 1;
 /// Pads per row.
@@ -372,6 +372,8 @@ pub struct SeqView {
     playing: bool,
     pattern: usize,
     params: [String; 2],
+    /// The rhythm the next press of CPT writes.
+    rhythm: Rhythm,
 }
 
 impl SeqView {
@@ -434,6 +436,7 @@ impl SeqView {
             playing: st.playing,
             pattern: st.current,
             params: [note_p, vel_p],
+            rhythm: st.lead_rhythm,
         }
     }
 }
@@ -459,6 +462,8 @@ pub struct BassView {
     /// Bar and step the clock is on within the phrase.
     play: Option<(usize, usize)>,
     params: [String; 1],
+    /// The rhythm the next press of CPT writes.
+    rhythm: Rhythm,
 }
 
 impl BassView {
@@ -496,6 +501,7 @@ impl BassView {
             locked: s.seq.bass_bar_lock,
             play,
             params: [format!("VEL {}", b.vel)],
+            rhythm: s.seq.bass_rhythm,
         }
     }
 }
@@ -998,7 +1004,7 @@ impl Screen {
         buttons.push((Button::BassBarLock, r));
         buttons.push((Button::DrumBarLock, r));
         // Parameters along the bottom of both pages, and the CLEAR /
-        // CNTRPT pair in the last group.
+        // CPT pair in the last group.
         let gap = (m / 2).max(2);
         let yp = (h as f64 * 0.86) as i32;
         let hp = h - m - yp;
@@ -1307,7 +1313,19 @@ impl Screen {
                     let label = if (sc.name().len() as i32) * 10 * s as i32 <= r.size.width as i32 - m { sc.name() } else { sc.short() };
                     (label.into(), key.and_then(|q| q.key).filter(|k| k.scale == *sc).map(|_| MANUAL))
                 }
-                Button::Generate(_) => (if 6 * 10 <= r.size.width as i32 - m { "CNTRPT" } else { "CPT" }.into(), None),
+                Button::Generate(inst) => {
+                    // with the size of the groups the next press writes
+                    let rhythm = match inst {
+                        Instrument::Lead => seq.map(|q| q.rhythm),
+                        Instrument::Bass => bass.map(|q| q.rhythm),
+                        Instrument::Drums => None,
+                    };
+                    let label = match rhythm {
+                        Some(x) if 5 * 10 <= r.size.width as i32 - m => format!("CPT {}", x.group()),
+                        _ => "CPT".into(),
+                    };
+                    (label, None)
+                }
                 Button::Clear(_) => (if 5 * 10 <= r.size.width as i32 - m { "CLEAR" } else { "CLR" }.into(), None),
                 Button::ParamMinus(_) | Button::BassMinus(_) | Button::DrumMinus(_) | Button::ChannelMinus(_) | Button::NoteLeadMinus => ("-".into(), None),
                 Button::ParamPlus(_) | Button::BassPlus(_) | Button::DrumPlus(_) | Button::ChannelPlus(_) | Button::NoteLeadPlus => ("+".into(), None),
