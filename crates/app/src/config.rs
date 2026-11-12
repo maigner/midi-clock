@@ -219,11 +219,14 @@ pub struct Midi {
     /// Rawmidi input port an external MIDI clock arrives on (MIDI IN mode);
     /// empty = none.
     pub in_device: String,
+    /// Send everything else that arrives there (notes, controllers, ...) on
+    /// to the output.
+    pub thru: bool,
 }
 
 impl Default for Midi {
     fn default() -> Self {
-        Self { enabled: true, device: "hw:CARD=US2x2,0,0".into(), lead_ms: 1.5, send_start_stop: true, in_device: "hw:CARD=US2x2,0,0".into() }
+        Self { enabled: true, device: "hw:CARD=US2x2,0,0".into(), lead_ms: 1.5, send_start_stop: true, in_device: "hw:CARD=US2x2,0,0".into(), thru: true }
     }
 }
 

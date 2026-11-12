@@ -13,10 +13,13 @@
 //! ever sends clock, or one that was started before the mode was switched)
 //! the first tick heard counts as a beat but the one is unknown; the ONE
 //! button then names it.
+//!
+//! The master's Start, Continue and Stop are also counted into the grid's
+//! `transport`, from where the MIDI clock output repeats them.
 
 use std::collections::VecDeque;
 
-use crate::grid::{Grid, State};
+use crate::grid::{Command, Grid, State, Transport};
 
 /// Ticks the fit covers: two beats.
 const FIT_TICKS: usize = 48;
@@ -62,6 +65,10 @@ pub struct MidiFollower {
     gaps: VecDeque<bool>,
     /// The clock arrives doubled: every second tick is dropped.
     paired: bool,
+    /// The master's transport messages, handed on with the grid.
+    transport: Transport,
+    /// The last transport message counted and when it came.
+    last_cmd: Option<(Command, f64)>,
 }
 
 impl MidiFollower {
@@ -78,11 +85,13 @@ impl MidiFollower {
             residual: 0.0,
             gaps: VecDeque::with_capacity(PAIR_HISTORY + 1),
             paired: false,
+            transport: Transport::default(),
+            last_cmd: None,
         }
     }
 
     pub fn grid(&self) -> Grid {
-        self.grid
+        Grid { transport: Some(self.transport), ..self.grid }
     }
 
     /// RMS of the last fit's residuals in seconds: the input's own jitter.
@@ -95,32 +104,59 @@ impl MidiFollower {
         self.last_tick_t.is_some_and(|t| now - t < SILENCE_S)
     }
 
-    /// MIDI Start (0xFA): the next tick is tick 0 of beat 0, the one.
-    pub fn start(&mut self, _t: f64) -> bool {
+    /// MIDI Start (0xFA) at monotonic time `t`: the next tick is tick 0 of
+    /// beat 0, the one. Returns whether the grid changed, like `cont` and `stop`.
+    pub fn start(&mut self, t: f64) -> bool {
+        if !self.command(Command::Start, t) {
+            return false;
+        }
         self.stopped = false;
         self.ticks.clear();
         self.next_tick = 0;
         self.last_tick_t = None;
         self.started_beat = true;
+        self.transport.first_tick = 0;
         // The grid restarts on the first tick; until then keep it stopped so
-        // the clock output sends Stop/Start around the new beat 0.
-        self.set_running(false)
+        // that no tick of the old count goes out after the Start.
+        self.set_running(false);
+        true
     }
 
     /// MIDI Continue (0xFB): ticks resume where they stopped.
-    pub fn cont(&mut self, _t: f64) -> bool {
+    pub fn cont(&mut self, t: f64) -> bool {
+        if !self.command(Command::Continue, t) {
+            return false;
+        }
         self.stopped = false;
         self.ticks.clear();
         self.last_tick_t = None;
-        false
+        self.transport.first_tick = self.next_tick;
+        true
     }
 
     /// MIDI Stop (0xFC).
-    pub fn stop(&mut self, _t: f64) -> bool {
+    pub fn stop(&mut self, t: f64) -> bool {
+        if !self.command(Command::Stop, t) {
+            return false;
+        }
         self.stopped = true;
         self.ticks.clear();
         self.idle_tick = 0;
-        self.set_running(false)
+        self.set_running(false);
+        true
+    }
+
+    /// Count a transport message of the master. False for the second of two
+    /// equal messages closer than `DUP_GAP`: a device that sends every byte
+    /// twice still starts and stops its slaves once.
+    fn command(&mut self, c: Command, t: f64) -> bool {
+        if self.last_cmd.is_some_and(|(c0, t0)| c0 == c && (t - t0).abs() < DUP_GAP) {
+            return false;
+        }
+        self.last_cmd = Some((c, t));
+        self.transport.seq = self.transport.seq.wrapping_add(1);
+        self.transport.last = Some(c);
+        true
     }
 
     /// The clock is heard doubled (every byte twice) and is being halved.
@@ -147,6 +183,7 @@ impl MidiFollower {
                     // Half of the ticks counted so far were duplicates.
                     self.paired = true;
                     self.next_tick = self.next_tick.div_euclid(2);
+                    self.transport.first_tick = self.transport.first_tick.div_euclid(2);
                     self.idle_tick = 0;
                     self.ticks.clear();
                     self.prior_period = self.prior_period.map(|p| p * 2.0);
@@ -164,6 +201,7 @@ impl MidiFollower {
                 // The clock was gone; this is a fresh start of unknown phase.
                 self.ticks.clear();
                 self.next_tick = 0;
+                self.transport.first_tick = 0;
                 self.started_beat = false;
                 self.grid.downbeat_known = false;
             } else if gap >= SILENCE_S || gap > PERIOD_MAX / 24.0 || gap < 0.0 {
@@ -385,6 +423,50 @@ mod tests {
         assert!(g.running && g.downbeat_known);
         // 48 ticks before the Stop: the clock continues at beat 2
         assert!((g.beat_time(2) - t2).abs() < 1e-6, "beat 2 at {} not {}", g.beat_time(2), t2);
+    }
+
+    #[test]
+    fn transport_messages_are_handed_on_with_the_grid() {
+        let mut f = MidiFollower::new(4);
+        let p = 0.5;
+        // clock only: a transport, but nothing said yet
+        let t = run_ticks(&mut f, 0.0, 30, p, 0.0);
+        assert!(f.grid().running);
+        assert_eq!(f.grid().transport, Some(Transport { seq: 0, last: None, first_tick: 0 }));
+        // Start while the clock runs: reported even though the grid was not stopped by it first
+        assert!(f.start(t));
+        let g = f.grid();
+        assert!(!g.running);
+        assert_eq!(g.transport, Some(Transport { seq: 1, last: Some(Command::Start), first_tick: 0 }));
+        let t = run_ticks(&mut f, t, 30, p, 0.0);
+        assert!(f.stop(t));
+        assert_eq!(f.grid().transport.unwrap().last, Some(Command::Stop));
+        // the master keeps sending clock while stopped: no change
+        let t = run_ticks(&mut f, t, 24, p, 0.0);
+        assert!(!f.grid().running);
+        // Continue: the clock resumes with tick 30
+        assert!(f.cont(t));
+        assert!(f.tick(t));
+        let g = f.grid();
+        assert!(g.running);
+        assert_eq!(g.transport, Some(Transport { seq: 3, last: Some(Command::Continue), first_tick: 30 }));
+        assert!((g.tick_time(1, 6) - t).abs() < 1e-9, "tick 30 is tick 6 of beat 1");
+    }
+
+    #[test]
+    fn a_doubled_transport_message_counts_once() {
+        let mut f = MidiFollower::new(4);
+        assert!(f.start(1.0));
+        assert!(!f.start(1.0005));
+        f.tick(1.001);
+        assert_eq!(f.grid().transport.unwrap().seq, 1);
+        assert!(f.stop(2.0));
+        assert!(!f.stop(2.0005));
+        assert_eq!(f.grid().transport.unwrap().seq, 2);
+        // the same message again later is a new one
+        assert!(f.stop(2.5));
+        assert!(f.start(3.0));
+        assert_eq!(f.grid().transport.unwrap().seq, 4);
     }
 
     #[test]

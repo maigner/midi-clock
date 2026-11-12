@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use tracker::Grid;
+use tracker::{Grid, Transport};
 use ui::Mode;
 
 pub struct Live {
@@ -30,12 +30,15 @@ pub struct Live {
 
 impl Live {
     pub fn new(mode: Mode) -> Self {
+        // The MIDI input's grid has a transport from the outset, so that the
+        // clock output is ready for the master's first Start.
+        let midi_in = Grid { transport: Some(Transport::default()), ..Grid::default() };
         Self {
             mode: Mutex::new(mode),
             mode_fast: AtomicU8::new(mode as u8),
-            grid: ArcSwap::from_pointee(Grid::default()),
+            grid: ArcSwap::from_pointee(if mode == Mode::MidiIn { midi_in } else { Grid::default() }),
             tracker_grid: ArcSwap::from_pointee(Grid::default()),
-            midi_in_grid: ArcSwap::from_pointee(Grid::default()),
+            midi_in_grid: ArcSwap::from_pointee(midi_in),
             adopt: AtomicBool::new(false),
             set_one: AtomicU64::new(0),
             set_one_midi: AtomicU64::new(0),

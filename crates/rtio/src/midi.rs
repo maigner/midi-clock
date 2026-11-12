@@ -1,4 +1,5 @@
-//! MIDI output and input. The output has two backends behind one type:
+//! MIDI output and input, and a parser that cuts an input's byte stream
+//! into messages. The output has two backends behind one type:
 //!
 //! * ALSA rawmidi (`hw:...`), the shortest path to a USB endpoint. This is
 //!   what runs on the Pi.
@@ -226,6 +227,100 @@ impl MidiIn {
     }
 }
 
+/// Longest System Exclusive message `Parser` hands on, F0 and F7 included.
+/// A longer one would hold up the clock ticks that share the cable.
+pub const SYSEX_MAX: usize = 64;
+
+/// Cuts the byte stream of a MIDI input into complete messages, so that
+/// each can be sent on between the messages of other senders: running
+/// status is written out, an unfinished message is dropped. Realtime bytes
+/// (0xF8..) may come in the middle of any message and are not handled here.
+pub struct Parser {
+    buf: [u8; SYSEX_MAX],
+    len: usize,
+    /// Length of the message being collected.
+    need: usize,
+    /// Status for data bytes that come without one (running status), 0 = none.
+    running: u8,
+    sysex: bool,
+    /// The SysEx being collected is longer than `SYSEX_MAX`.
+    overflow: bool,
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self { buf: [0; SYSEX_MAX], len: 0, need: 0, running: 0, sysex: false, overflow: false }
+    }
+}
+
+impl Parser {
+    /// Take the next byte of the stream. Returns the message it completes.
+    pub fn push(&mut self, b: u8) -> Option<&[u8]> {
+        match b {
+            0xF8..=0xFF => None,
+            0xF0 => {
+                self.buf[0] = b;
+                self.len = 1;
+                self.sysex = true;
+                self.overflow = false;
+                self.running = 0;
+                None
+            }
+            0xF7 => {
+                let n = self.len;
+                let whole = self.sysex && !self.overflow;
+                self.len = 0;
+                self.sysex = false;
+                if !whole {
+                    return None;
+                }
+                self.buf[n] = b;
+                Some(&self.buf[..=n])
+            }
+            0x80..=0xF6 => {
+                // A status byte ends whatever was unfinished, a SysEx too.
+                self.sysex = false;
+                self.running = if b < 0xF0 { b } else { 0 };
+                self.need = match b {
+                    0xC0..=0xDF | 0xF1 | 0xF3 => 2,
+                    0xF6 => 1,
+                    0xF4 | 0xF5 => 0,
+                    _ => 3,
+                };
+                self.buf[0] = b;
+                self.len = usize::from(self.need > 1);
+                (self.need == 1).then_some(&self.buf[..1])
+            }
+            _ if self.sysex => {
+                if self.len < SYSEX_MAX - 1 {
+                    self.buf[self.len] = b;
+                    self.len += 1;
+                } else {
+                    self.overflow = true;
+                }
+                None
+            }
+            _ => {
+                if self.len == 0 {
+                    if self.running == 0 {
+                        return None;
+                    }
+                    self.buf[0] = self.running;
+                    self.len = 1;
+                }
+                self.buf[self.len] = b;
+                self.len += 1;
+                if self.len < self.need {
+                    return None;
+                }
+                let n = self.len;
+                self.len = 0;
+                Some(&self.buf[..n])
+            }
+        }
+    }
+}
+
 /// Human-readable list of rawmidi ports on all cards in `dir`.
 fn list_ports(dir: Direction) -> Vec<String> {
     let mut out = Vec::new();
@@ -261,4 +356,49 @@ pub fn list_outputs() -> Vec<String> {
 /// Human-readable list of rawmidi input ports on all cards.
 pub fn list_inputs() -> Vec<String> {
     list_ports(Direction::Capture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut p = Parser::default();
+        bytes.iter().filter_map(|&b| p.push(b).map(<[u8]>::to_vec)).collect()
+    }
+
+    #[test]
+    fn running_status_is_written_out() {
+        assert_eq!(parse(&[0x93, 60, 100, 62, 90, 60, 0]), [[0x93, 60, 100], [0x93, 62, 90], [0x93, 60, 0]]);
+        // program change and channel pressure have one data byte
+        assert_eq!(parse(&[0xC1, 5, 6, 0xD0, 7]), [[0xC1, 5], [0xC1, 6], [0xD0, 7]]);
+        // data before any status is nobody's
+        assert!(parse(&[60, 100, 0x80]).is_empty());
+    }
+
+    #[test]
+    fn realtime_bytes_inside_a_message_do_not_break_it() {
+        assert_eq!(parse(&[0x90, CLOCK, 60, START, 100, 0xFE, 0xB0, 7, CLOCK, 127]), [[0x90, 60, 100], [0xB0, 7, 127]]);
+    }
+
+    #[test]
+    fn system_common_messages() {
+        // song position, song select, tune request; no running status after them
+        assert_eq!(parse(&[0xF2, 1, 2, 3, 4, 0xF3, 9, 0xF6, 0x90, 1, 2]), [vec![0xF2, 1, 2], vec![0xF3, 9], vec![0xF6], vec![0x90, 1, 2]]);
+    }
+
+    #[test]
+    fn short_sysex_passes_and_long_sysex_is_dropped() {
+        assert_eq!(parse(&[0xF0, 0x7F, 0x7F, 6, 2, 0xF7]), [[0xF0, 0x7F, 0x7F, 6, 2, 0xF7]]);
+        let mut full = vec![0xF0];
+        full.extend(std::iter::repeat(1).take(SYSEX_MAX - 2));
+        full.push(0xF7);
+        assert_eq!(parse(&full), [full.clone()]);
+        let mut long = vec![0xF0];
+        long.extend(std::iter::repeat(1).take(SYSEX_MAX - 1));
+        long.extend([0xF7, 0x90, 60, 100]);
+        assert_eq!(parse(&long), [[0x90, 60, 100]]);
+        // a SysEx cut off by another message is dropped, the message is not
+        assert_eq!(parse(&[0xF0, 1, 2, 0x90, 60, 100, 0xF7]), [[0x90, 60, 100]]);
+    }
 }

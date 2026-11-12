@@ -12,7 +12,7 @@ pub mod manual;
 pub mod midi_in;
 pub mod tempo;
 
-pub use grid::{Grid, State};
+pub use grid::{Command, Grid, State, Transport};
 pub use manual::{ManualClock, ManualConfig};
 pub use midi_in::MidiFollower;
 
@@ -212,6 +212,7 @@ impl Tracker {
     /// there, and the usual coast/stop rules apply.
     pub fn adopt(&mut self, g: Grid, now: f64) {
         self.grid = g;
+        self.grid.transport = None;
         self.grid.bar_len = self.cfg.bar_len;
         self.grid.state = if g.running { State::Coasting } else { State::Idle };
         self.grid.confidence = if g.running { 0.3 } else { 0.0 };

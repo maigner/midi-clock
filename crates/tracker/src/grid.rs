@@ -15,6 +15,28 @@ pub enum State {
     Stopped,
 }
 
+/// A transport message of an external clock master.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Start,
+    Continue,
+    Stop,
+}
+
+/// What an external clock master (MIDI IN) said about its transport. A grid
+/// that carries one hands the master's Start, Continue and Stop on to the
+/// MIDI output as they came; `running` then only says whether ticks go out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Transport {
+    /// Counts the master's Start, Continue and Stop messages.
+    pub seq: u32,
+    /// The latest of them, `None` until the first.
+    pub last: Option<Command>,
+    /// The tick (24 per beat, tick 0 opens beat 0) the master's clock began
+    /// or resumed with: 0 after a Start, where it stopped after a Continue.
+    pub first_tick: i64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Grid {
     /// Incremented every time the clock is (re)started. Consumers reset their
@@ -39,6 +61,9 @@ pub struct Grid {
     /// decisively for a whole bar and fits `bar_len` better than another
     /// meter. The accent click needs it.
     pub downbeat_known: bool,
+    /// Set while an external master with a transport of its own is in
+    /// charge. `None`: Start/Stop on the MIDI output follow `running`.
+    pub transport: Option<Transport>,
 }
 
 impl Default for Grid {
@@ -54,6 +79,7 @@ impl Default for Grid {
             bar_len: 4,
             downbeat: 0,
             downbeat_known: false,
+            transport: None,
         }
     }
 }

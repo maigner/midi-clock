@@ -121,6 +121,19 @@ other tabs show nothing in the top bar but xruns:
   **+1/-1/+5/-5** change the tempo without moving the current beat (hold for
   auto-repeat), **START/STOP** send MIDI Start/Stop. The screen still shows
   what the mic hears, so you can see whether the band is with you.
+- **MIDI IN**: a MIDI clock arriving on the MIDI input (`[midi] in_device`)
+  is the master; click, sequencer and the MIDI clock output follow it. The
+  master's Start, Continue and Stop are passed on to the MIDI output as they
+  come in, so whatever is connected there starts and stops with the master.
+  Nothing is made up in this mode: a master that only sends clock gives
+  clock on the output and no Start. A Start makes the tick after it beat
+  one, for the click and for the sequencers, whose phrases begin there;
+  **ONE** names beat one when the master never said Start.
+- **MIDI thru** (`[midi] thru`, on by default, in every mode): notes,
+  controllers and everything else arriving on the MIDI input go on to the
+  MIDI output, merged with the clock and the sequencers' notes. Only the
+  clock itself is not copied: it is used for the timing and sent afresh.
+  Active sensing and System Exclusive messages over 64 bytes are left out.
 - **Switching** is seamless in both directions: MANUAL takes over the running
   grid unchanged; AUTO continues from the manual grid and lets onsets correct
   it from there, which is also a quick way to get the tracker onto a known

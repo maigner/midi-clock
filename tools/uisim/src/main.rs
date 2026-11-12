@@ -186,7 +186,7 @@ fn main() -> Result<()> {
         let stop = stop.clone();
         let stats = clock_stats.clone();
         let ccfg = midiclock::ClockConfig { lead_s: 0.0, send_start_stop: true };
-        std::thread::spawn(move || midiclock::run(|| *live.lock().unwrap(), &midi, &ccfg, &stop, &stats))
+        std::thread::spawn(move || midiclock::run(|| *live.lock().unwrap(), &*midi, &ccfg, &stop, &stats))
     });
     // Sequencer: real thread, notes to the MIDI port and/or stderr.
     let seq_path = args.patterns.clone();

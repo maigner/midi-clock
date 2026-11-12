@@ -65,6 +65,7 @@ impl ManualClock {
     /// running state continue unchanged.
     pub fn adopt(&mut self, g: &Grid) {
         self.grid = *g;
+        self.grid.transport = None;
         self.grid.state = if g.running { State::Running } else { State::Stopped };
         self.grid.confidence = 1.0;
         self.grid.bar_len = self.cfg.bar_len.max(1);
@@ -259,10 +260,12 @@ mod tests {
     #[test]
     fn adopt_keeps_the_grid_and_stop_clears() {
         let mut c = clock();
-        let g = Grid { running: true, epoch: 7, t0: 5.0, n0: 12, period: 0.4, state: State::Coasting, ..Grid::default() };
+        let transport = Some(crate::Transport::default());
+        let g = Grid { running: true, epoch: 7, t0: 5.0, n0: 12, period: 0.4, state: State::Coasting, transport, ..Grid::default() };
         c.adopt(&g);
         let a = c.grid();
         assert_eq!((a.epoch, a.n0, a.t0, a.period, a.state), (7, 12, 5.0, 0.4, State::Running));
+        assert_eq!(a.transport, None, "the manual clock decides Start/Stop itself");
         c.stop();
         assert!(!c.grid().running);
         c.start(20.0);

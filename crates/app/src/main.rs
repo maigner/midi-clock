@@ -228,6 +228,8 @@ struct Shared {
     key_overflow: AtomicU64,
     /// Realtime messages (clock, start, stop) read from the MIDI input.
     midi_in_msgs: AtomicU64,
+    /// Other messages from the MIDI input sent on to the output.
+    midi_thru: AtomicU64,
     /// Largest move of a beat by one follower update since the last status line (us).
     midi_in_shift_us: AtomicU32,
     /// The follower's fit residual (input jitter), us.
@@ -372,6 +374,7 @@ fn main() -> Result<()> {
         _ => None,
     };
 
+    let thru = if cfg.midi.thru { midi.clone() } else { None };
     let midi_thread = midi.map(|midi| {
         let live = live.clone();
         let shared = shared.clone();
@@ -384,14 +387,15 @@ fn main() -> Result<()> {
                 for w in rtio::rt::setup_thread("midi", prio, cpu) {
                     eprintln!("warning: {w}");
                 }
-                midiclock::run(|| **live.grid.load(), &midi, &ccfg, &shared.stop, &stats);
+                midiclock::run(|| **live.grid.load(), &*midi, &ccfg, &shared.stop, &stats);
             })
             .expect("spawn midi thread")
     });
 
     // --- MIDI input thread ---------------------------------------------------
     // Reads the MIDI input and keeps the external clock's grid up to date;
-    // in MIDI IN mode that grid is the live one.
+    // in MIDI IN mode that grid is the live one. Whatever else arrives
+    // (notes, controllers, ...) goes straight on to the output.
     let midi_in = if cfg.midi.in_device.is_empty() || args.no_midi {
         eprintln!("midi in: disabled");
         None
@@ -419,6 +423,7 @@ fn main() -> Result<()> {
                     eprintln!("warning: {w}");
                 }
                 let mut f = MidiFollower::new(bar_len);
+                let mut parser = rtio::midi::Parser::default();
                 let mut buf = [0u8; 256];
                 // Ticks that queued up before we listened would all carry
                 // this moment's timestamp: throw them away.
@@ -438,19 +443,28 @@ fn main() -> Result<()> {
                             let t = rtio::now();
                             let mut changed = false;
                             let mut msgs = 0;
+                            let mut sent = 0;
                             for &b in &buf[..n] {
                                 let c = match b {
                                     rtio::midi::CLOCK => f.tick(t),
                                     rtio::midi::START => f.start(t),
                                     rtio::midi::CONTINUE => f.cont(t),
                                     rtio::midi::STOP => f.stop(t),
-                                    _ => continue,
+                                    _ => {
+                                        if let (Some(out), Some(msg)) = (&thru, parser.push(b)) {
+                                            sent += u64::from(out.send(msg).is_ok());
+                                        }
+                                        continue;
+                                    }
                                 };
                                 msgs += 1;
                                 changed |= c;
                             }
                             if msgs > 0 {
                                 shared.midi_in_msgs.fetch_add(msgs, Ordering::Relaxed);
+                            }
+                            if sent > 0 {
+                                shared.midi_thru.fetch_add(sent, Ordering::Relaxed);
                             }
                             if changed {
                                 let old = **live.midi_in_grid.load();
@@ -862,14 +876,19 @@ fn main() -> Result<()> {
             let n = shared.midi_in_msgs.load(Ordering::Relaxed);
             let shift = shared.midi_in_shift_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
             let jit = shared.midi_in_jitter_us.load(Ordering::Relaxed) as f64 / 1000.0;
+            // The master's last transport message and how many it sent.
+            let cmd = match g.transport {
+                Some(tracker::Transport { seq, last: Some(c), .. }) => format!(" {c:?} #{seq}"),
+                _ => String::new(),
+            };
             match g.state {
                 State::Idle if n == 0 => String::new(),
-                State::Running => format!("  ext {:.1} bpm jit {jit:.1} shift {shift:.2} ms", g.bpm()),
-                _ => "  ext stopped".to_string(),
+                State::Running => format!("  ext {:.1} bpm jit {jit:.1} shift {shift:.2} ms{cmd}", g.bpm()),
+                _ => format!("  ext stopped{cmd}"),
             }
         };
         let line = format!(
-            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  spread {spread:.2}{hold}  bias {:+.0} ms{ext}  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  xruns {}",
+            "{mode:6} {state:8} {:6.1} bpm  conf {:.2}  tempo-str {:.2}  spread {spread:.2}{hold}  bias {:+.0} ms{ext}  in {level:5.1} dBFS{clip}  key {key_s}  onsets {}  clicks {}  ticks {}  starts {}  stops {}  thru {}  xruns {}",
             g.bpm(),
             g.confidence,
             shared.tempo_strength_milli.load(Ordering::Relaxed) as f32 / 1000.0,
@@ -877,6 +896,9 @@ fn main() -> Result<()> {
             shared.onsets.load(Ordering::Relaxed),
             shared.clicks.load(Ordering::Relaxed),
             clock_stats.ticks.load(Ordering::Relaxed),
+            clock_stats.starts.load(Ordering::Relaxed),
+            clock_stats.stops.load(Ordering::Relaxed),
+            shared.midi_thru.load(Ordering::Relaxed),
             shared.xruns.load(Ordering::Relaxed),
         );
         if args.verbose || !on_tty {
@@ -916,7 +938,11 @@ fn main() -> Result<()> {
     }
     if let Some(t) = midi_in_thread {
         let _ = t.join();
-        eprintln!("midi in: {} realtime messages", shared.midi_in_msgs.load(Ordering::Relaxed));
+        eprintln!(
+            "midi in: {} realtime messages, {} others sent on",
+            shared.midi_in_msgs.load(Ordering::Relaxed),
+            shared.midi_thru.load(Ordering::Relaxed)
+        );
     }
     eprintln!("xruns: {}", shared.xruns.load(Ordering::Relaxed));
     if shared.audio_error.load(Ordering::Relaxed) {

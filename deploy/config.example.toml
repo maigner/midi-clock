@@ -57,8 +57,9 @@ full_weight_strength = 6.0
 enabled = true
 device = "hw:CARD=US2x2,0,0"          # rawmidi port (see --list-devices) or "virtual" for an ALSA sequencer port
 lead_ms = 1.5                         # send each tick this early (USB + slave latency)
-send_start_stop = true
+send_start_stop = true                # Start/Stop on the output; in MIDI IN mode the master's Start/Continue/Stop are passed on
 in_device = "hw:CARD=US2x2,0,0"       # MIDI IN mode follows the MIDI clock arriving here ("" = no input)
+thru = true                           # notes, controllers and the rest arriving there go on to the output, in every mode
 
 [click]
 enabled = true
